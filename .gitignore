@@ -1,6 +1,16 @@
+# Python
 __pycache__/
+*.py[cod]
+*.pyo
+*.pyd
 *.pkl
+
+# Virtual environment
 venv/
 .env/
+
+# OS files
 .DS_Store
+
+# Streamlit
 .streamlit/
