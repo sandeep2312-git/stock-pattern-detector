@@ -37,16 +37,26 @@ def engineer_features_for_app(df):
         close = close.iloc[:, 0]
     close = pd.Series(close)
 
+    # Daily and multi-day returns
     df["return_1d"] = close.pct_change()
+    df["return_2d"] = close.pct_change(2)
+    df["return_5d"] = close.pct_change(5)
 
+    # Moving averages
     df["ma_5"] = close.rolling(window=5).mean()
     df["ma_10"] = close.rolling(window=10).mean()
     df["ma_20"] = close.rolling(window=20).mean()
 
+    # Ratios
+    df["ma_5_20_ratio"] = df["ma_5"] / (df["ma_20"] + 1e-9)
+    df["ma_10_20_ratio"] = df["ma_10"] / (df["ma_20"] + 1e-9)
+
+    # Volatility
     df["vol_5"] = df["return_1d"].rolling(window=5).std()
     df["vol_10"] = df["return_1d"].rolling(window=10).std()
 
-    df["rsi_14"] = compute_rsi(close)
+    # RSI
+    df["rsi_14"] = compute_rsi(close, period=14)
 
     df.dropna(inplace=True)
     return df
@@ -96,9 +106,27 @@ def main():
 
     col1, col2 = st.columns(2)
     with col1:
-        ticker = st.text_input("Ticker Symbol", "AAPL")
+        common_tickers = [
+            "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NFLX", "TSLA",
+            "NVDA", "AMD", "INTC", "QCOM", "SPY", "QQQ", "V", "MA",
+            "JPM", "BAC", "WMT", "TGT", "DIS", "NKE", "XOM", "CVX",
+            "TSM", "ADBE", "CRM", "PYPL", "CSCO", "ORCL", "UPS",
+        ]
+        selected_ticker = st.selectbox(
+            "Select Ticker (scrollable list)",
+            options=common_tickers,
+            index=0,
+        )
+        custom_ticker = st.text_input("Or type a custom ticker (optional)", "")
+        ticker = custom_ticker.strip().upper() if custom_ticker.strip() else selected_ticker
+
     with col2:
-        period = st.selectbox("Historical Period", ["6mo", "1y", "2y", "5y"], index=1)
+        period = st.selectbox(
+            "Historical Period",
+            ["6mo", "1y", "2y", "5y"],
+            index=1,
+        )
+
 
     if st.button("🔍 Analyze"):
         with st.spinner("Fetching and analyzing data..."):
