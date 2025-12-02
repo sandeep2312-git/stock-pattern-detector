@@ -17,18 +17,27 @@ def download_data(ticker="AAPL", period="5y", interval="1d"):
 
 
 def compute_rsi(series, period=14):
+    """
+    Compute RSI (Relative Strength Index) for a 1D price series.
+    """
+    # Ensure it's a pandas Series (not DataFrame)
+    series = pd.Series(series)
+
+    # Price changes
     delta = series.diff()
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
 
-    gain_series = pd.Series(gain, index=series.index)
-    loss_series = pd.Series(loss, index=series.index)
+    # Gains (up moves) and losses (down moves)
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    gain_rolling = gain_series.rolling(window=period).mean()
-    loss_rolling = loss_series.rolling(window=period).mean()
+    # Rolling averages
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
 
-    rs = gain_rolling / (loss_rolling + 1e-9)
+    # RS and RSI
+    rs = avg_gain / (avg_loss + 1e-9)
     rsi = 100 - (100 / (1 + rs))
+
     return rsi
 
 
