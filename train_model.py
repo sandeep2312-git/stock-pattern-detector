@@ -1,28 +1,36 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
+from sklearn.metrics import (
+    classification_report,
+    accuracy_score,
+    mean_absolute_error,
+    r2_score,
+)
 import joblib
 import os
 
-MODEL_PATH = "models/saved_model.pkl"
+DAILY_MODEL_PATH = "models/saved_model.pkl"
 
 
-def download_data(ticker="AAPL", period="10y", interval="1d"):
+def download_data(
+    ticker: str = "AAPL", period: str = "10y", interval: str = "1d"
+) -> pd.DataFrame:
     """
-    Download historical OHLCV data for a given ticker.
+    Download historical OHLCV data for a given ticker using yfinance.
+    Daily bars by default.
     """
     df = yf.download(ticker, period=period, interval=interval)
     df.dropna(inplace=True)
     return df
 
 
-def compute_rsi(series, period=14):
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     """
     Compute RSI (Relative Strength Index) for a price series.
-    Assumes `series` is a pandas Series.
+    Assumes `series` is a 1D pandas Series.
     """
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -37,19 +45,21 @@ def compute_rsi(series, period=14):
     return rsi
 
 
-def engineer_features(df):
+def engineer_features(df: pd.DataFrame):
     """
-    Create features for the ML model based on historical price data.
+    Create features for the DAILY ML model based on historical price data.
+
+    This MUST match engineer_features_for_app() in app.py.
     """
     df = df.copy()
 
-    # Ensure Close is 1D
+    # Ensure Close is 1D Series
     close = df["Close"]
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
     close = pd.Series(close)
 
-    # Daily and multi-day returns
+    # Daily and multi-day returns (1, 2, 5 bars)
     df["return_1d"] = close.pct_change()
     df["return_2d"] = close.pct_change(2)
     df["return_5d"] = close.pct_change(5)
@@ -70,66 +80,102 @@ def engineer_features(df):
     # RSI
     df["rsi_14"] = compute_rsi(close, period=14)
 
-    # Next-day close and label (1 = up, 0 = down/flat)
+    # Next-day close and targets
     next_close = close.shift(-1)
     df["next_close"] = next_close
-    df["next_return"] = (next_close - close) / close
-    df["target_up"] = (df["next_return"] > 0).astype(int)
+    df["next_return"] = (next_close - close) / close  # regression target
+    df["target_up"] = (df["next_return"] > 0).astype(int)  # classification target
 
-    # Drop rows with NaN from rolling windows & shift
+    # Drop rows with NaNs from rolling/shift
     df.dropna(inplace=True)
 
     feature_cols = [
-        "return_1d", "return_2d", "return_5d",
-        "ma_5", "ma_10", "ma_20",
-        "ma_5_20_ratio", "ma_10_20_ratio",
-        "vol_5", "vol_10",
+        "return_1d",
+        "return_2d",
+        "return_5d",
+        "ma_5",
+        "ma_10",
+        "ma_20",
+        "ma_5_20_ratio",
+        "ma_10_20_ratio",
+        "vol_5",
+        "vol_10",
         "rsi_14",
     ]
 
     X = df[feature_cols]
-    y = df["target_up"]
+    y_cls = df["target_up"]
+    y_reg = df["next_return"]
 
-    return X, y, feature_cols
+    return X, y_cls, y_reg, feature_cols
 
 
-def train_model(ticker="AAPL"):
-    print(f"Downloading data for {ticker}...")
+def train_model(ticker: str = "AAPL"):
+    print(f"Downloading DAILY data for {ticker}...")
     df = download_data(ticker=ticker)
 
-    print("Engineering features...")
-    X, y, feature_cols = engineer_features(df)
+    print("Engineering DAILY features...")
+    X, y_cls, y_reg, feature_cols = engineer_features(df)
 
-    print("Splitting train/test...")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, shuffle=False
+    print("Splitting train/test (daily)...")
+    X_train, X_test, y_cls_train, y_cls_test, y_reg_train, y_reg_test = train_test_split(
+        X,
+        y_cls,
+        y_reg,
+        test_size=0.2,
+        shuffle=False,  # keep time order
     )
 
-    print("Training RandomForestClassifier (stronger config)...")
+    # ---- Classification model (direction UP/DOWN) ----
+    print("\nTraining RandomForestClassifier (DAILY direction)...")
     clf = RandomForestClassifier(
+        n_estimators=400,
+        max_depth=10,
+        min_samples_leaf=3,
+        class_weight="balanced_subsample",
+        random_state=42,
+        n_jobs=-1,
+    )
+    clf.fit(X_train, y_cls_train)
+
+    print("\nEvaluating DAILY classifier...")
+    y_cls_pred = clf.predict(X_test)
+    cls_acc = accuracy_score(y_cls_test, y_cls_pred)
+    print(f"DAILY classification accuracy: {cls_acc:.4f}")
+    print("Classification report:")
+    print(classification_report(y_cls_test, y_cls_pred))
+
+    # ---- Regression model (magnitude of move) ----
+    print("\nTraining RandomForestRegressor (next-day return)...")
+    reg = RandomForestRegressor(
         n_estimators=400,
         max_depth=10,
         min_samples_leaf=3,
         random_state=42,
         n_jobs=-1,
     )
-    clf.fit(X_train, y_train)
+    reg.fit(X_train, y_reg_train)
 
-    print("Evaluating model...")
-    y_pred = clf.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
-    print(f"Accuracy: {acc:.4f}")
-    print("Classification report:")
-    print(classification_report(y_test, y_pred))
+    print("\nEvaluating DAILY regressor...")
+    y_reg_pred = reg.predict(X_test)
+    mae = mean_absolute_error(y_reg_test, y_reg_pred)
+    r2 = r2_score(y_reg_test, y_reg_pred)
+    print(f"DAILY MAE: {mae:.5f} (~{mae * 100:.2f}% move)")
+    print(f"DAILY R²: {r2:.4f}")
 
-    # Save model + feature columns together
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    # ---- Save both models + feature columns ----
+    os.makedirs(os.path.dirname(DAILY_MODEL_PATH), exist_ok=True)
     joblib.dump(
-        {"model": clf, "features": feature_cols},
-        MODEL_PATH,
+        {
+            "clf": clf,  # classifier
+            "reg": reg,  # regressor
+            "features": feature_cols,
+        },
+        DAILY_MODEL_PATH,
     )
-    print(f"Model saved to {MODEL_PATH}")
+    print(f"\nDAILY models saved to {DAILY_MODEL_PATH}")
 
 
 if __name__ == "__main__":
+    # Train DAILY model for 1 ticker (AAPL by default)
     train_model(ticker="AAPL")
