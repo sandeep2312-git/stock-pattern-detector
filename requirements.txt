@@ -1,7 +1,7 @@
+streamlit
+yfinance
 pandas
 numpy
-yfinance
 scikit-learn
-matplotlib
-streamlit
 joblib
+matplotlib
