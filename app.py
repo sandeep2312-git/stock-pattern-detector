@@ -1,29 +1,25 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import joblib
 import os
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import joblib
 import matplotlib.pyplot as plt
+import streamlit as st
 
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 
-# Paths for classic ML models
+
+# --------- Paths ----------
 DAILY_MODEL_PATH = "models/saved_model.pkl"
 HOURLY_MODEL_PATH = "models/saved_model_hourly.pkl"
 
-# Paths for deep learning model
 DL_MODEL_DIR = "models/dl_model"
 DL_META_PATH = "models/dl_meta.pkl"
 
 
-# ---------- RSI CALCULATION ----------
-def compute_rsi(series, period=14):
-    """
-    Compute RSI using 1D-safe pandas operations.
-    Assumes `series` is a pandas Series.
-    """
+# --------- Indicators ----------
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -37,59 +33,36 @@ def compute_rsi(series, period=14):
     return rsi
 
 
-# ---------- FEATURE ENGINEERING (shared) ----------
 def engineer_features_for_app(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Create the SAME features as used during training in:
-    - train_model.py (daily)
-    - train_model_hourly.py (hourly)
-    - train_model_dl.py (deep learning, daily)
-
-    Here, "d" in return_1d, etc., just means "1 bar"
-    (1 day for daily mode, 1 hour for hourly mode).
-    """
     df = df.copy()
 
-    # Ensure Close is 1D
     close = df["Close"]
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
     close = pd.Series(close)
 
-    # Returns
     df["return_1d"] = close.pct_change()
     df["return_2d"] = close.pct_change(2)
     df["return_5d"] = close.pct_change(5)
 
-    # Moving averages
     df["ma_5"] = close.rolling(window=5).mean()
     df["ma_10"] = close.rolling(window=10).mean()
     df["ma_20"] = close.rolling(window=20).mean()
 
-    # Ratios of moving averages (trend strength)
     df["ma_5_20_ratio"] = df["ma_5"] / (df["ma_20"] + 1e-9)
     df["ma_10_20_ratio"] = df["ma_10"] / (df["ma_20"] + 1e-9)
 
-    # Volatility
     df["vol_5"] = df["return_1d"].rolling(window=5).std()
     df["vol_10"] = df["return_1d"].rolling(window=10).std()
 
-    # RSI
     df["rsi_14"] = compute_rsi(close, period=14)
 
-    # Drop rows with NaNs created by rolling/shift
     df.dropna(inplace=True)
 
     return df
 
 
-# ---------- PATTERN DETECTION ----------
-def get_pattern_label(preds, closes):
-    """
-    Use recent predictions + price slope to label the pattern.
-    preds: array-like of 0/1 direction predictions
-    closes: array-like of prices, aligned with preds
-    """
+def get_pattern_label(preds, closes) -> str:
     preds = np.array(preds)
     closes = np.array(closes)
 
@@ -97,7 +70,7 @@ def get_pattern_label(preds, closes):
         return "Not enough data"
 
     last5 = preds[-5:]
-    ones_ratio = last5.mean()  # avg of last 5 predicted up(1)/down(0)
+    ones_ratio = last5.mean()
 
     last_prices = closes[-10:]
     x = np.arange(len(last_prices))
@@ -111,48 +84,39 @@ def get_pattern_label(preds, closes):
         return "SIDEWAYS / NEUTRAL"
 
 
-# ---------- LOAD RANDOMFOREST MODELS ----------
+# --------- Model loading ----------
 def load_rf_model(mode: str = "daily"):
-    """
-    mode: "daily" or "hourly"
-    """
     model_path = DAILY_MODEL_PATH if mode == "daily" else HOURLY_MODEL_PATH
 
     if not os.path.exists(model_path):
         st.error(
             f"RandomForest model not found for mode={mode}. "
-            f"Expected file: {model_path}. "
-            "Please run the appropriate training script and commit the model."
+            f"Expected file: {model_path}. Run the training script first."
         )
         return None, None, None
 
     bundle = joblib.load(model_path)
-
-    clf = bundle.get("clf", None)
-    reg = bundle.get("reg", None)
-    feature_cols = bundle.get("features", None)
+    clf = bundle.get("clf")
+    reg = bundle.get("reg")
+    feature_cols = bundle.get("features")
 
     if clf is None or reg is None or feature_cols is None:
         st.error(
             f"Model file {model_path} is missing required keys. "
-            "Retrain with the latest train_model.py or train_model_hourly.py."
+            "Retrain with the latest training script."
         )
         return None, None, None
 
     return clf, reg, feature_cols
 
 
-# ---------- LOAD DEEP LEARNING MODEL ----------
 @st.cache_resource
 def load_dl_model():
-    """
-    Load the LSTM deep learning model and metadata.
-    """
     if (not os.path.exists(DL_MODEL_DIR)) or (not os.path.exists(DL_META_PATH)):
         st.error(
             f"Deep learning model not found. "
             f"Expected: {DL_MODEL_DIR} and {DL_META_PATH}. "
-            "Run train_model_dl.py first."
+            "Run train_model_dl.py first and push the files to GitHub."
         )
         return None, None
 
@@ -162,12 +126,7 @@ def load_dl_model():
     return model, meta
 
 
-def build_sequences_for_app(X_scaled: np.ndarray, window: int):
-    """
-    Build sliding window sequences over X_scaled.
-    Returns:
-    - X_seq: (num_samples, window, num_features)
-    """
+def build_sequences_for_app(X_scaled: np.ndarray, window: int) -> np.ndarray:
     seqs = []
     for i in range(window, len(X_scaled)):
         seqs.append(X_scaled[i - window : i])
@@ -176,7 +135,7 @@ def build_sequences_for_app(X_scaled: np.ndarray, window: int):
     return np.array(seqs)
 
 
-# ---------- STREAMLIT APP ----------
+# --------- Streamlit app ----------
 def main():
     st.set_page_config(
         page_title="Stock Pattern Detector",
@@ -184,36 +143,37 @@ def main():
         layout="wide",
     )
 
-    st.title("📈 Stock Pattern Detector – v2 (ML + Deep Learning)")
+    st.title("📈 Stock Pattern Detector – ML + Deep Learning")
     st.caption(
-        "Daily & hourly stock signals with RandomForest and LSTM (deep learning). "
-        "Direction (UP/DOWN) and expected % move based on technical patterns."
+        "Short-term stock direction (UP/DOWN) and expected % move using "
+        "RandomForest (daily & hourly) and LSTM (daily)."
     )
 
-    # Sidebar info
-    st.sidebar.title("ℹ️ About this app")
+    st.sidebar.title("ℹ️ About")
     st.sidebar.markdown(
         """
-**Models:**
-- **RandomForest (Classic ML)** – daily & hourly
-- **LSTM (Deep Learning)** – daily only
+**Models**
 
-**Targets:**
-- Direction: **UP (1)** vs **DOWN/FLAT (0)**
-- Magnitude: approximate **% move next bar**
+- RandomForest (classic ML) – daily & hourly  
+- LSTM (deep learning) – daily only  
 
-**Features:**
-- Returns (1, 2, 5 bars)
-- Moving averages (5 / 10 / 20)
-- MA ratios (trend)
-- Volatility
-- RSI (14)
+**Targets**
 
-> ⚠️ For learning/demo only, **not** financial advice.
+- Direction: UP (1) vs DOWN/FLAT (0)  
+- Magnitude: next bar % move  
+
+**Features**
+
+- Returns (1, 2, 5 bars)  
+- Moving averages (5 / 10 / 20)  
+- MA ratios  
+- Volatility  
+- RSI(14)  
+
+> Educational only. Not financial advice.
 """
     )
 
-    # Controls
     col_top1, col_top2 = st.columns([1.2, 1])
 
     with col_top1:
@@ -234,15 +194,14 @@ def main():
             horizontal=True,
         )
 
-    # For now, LSTM only supports daily
     if algo.startswith("LSTM") and mode == "hourly":
-        st.warning("Deep Learning (LSTM) is currently available only in DAILY mode.")
+        st.warning("LSTM (Deep Learning) is currently available only in DAILY mode.")
         mode = "daily"
         horizon_text = "next day"
 
-    col_input1, col_input2 = st.columns([1.2, 1])
+    col_in1, col_in2 = st.columns([1.2, 1])
 
-    with col_input1:
+    with col_in1:
         common_tickers = [
             "AAPL",
             "MSFT",
@@ -274,15 +233,11 @@ def main():
             "CSCO",
             "ORCL",
         ]
-        selected_ticker = st.selectbox(
-            "Select ticker (scrollable list):",
-            options=common_tickers,
-            index=0,
-        )
+        selected_ticker = st.selectbox("Select ticker:", options=common_tickers, index=0)
         custom_ticker = st.text_input("Or type a custom ticker:", "")
         ticker = custom_ticker.strip().upper() if custom_ticker.strip() else selected_ticker
 
-    with col_input2:
+    with col_in2:
         if mode == "daily":
             period = st.selectbox(
                 "Historical period:",
@@ -300,7 +255,6 @@ def main():
             f"Fetching data for **{ticker}** and running predictions "
             f"({mode.upper()} • {algo.split()[0]})..."
         ):
-            # Choose interval and effective period
             if mode == "daily":
                 yf_interval = "1d"
                 yf_period = period
@@ -315,18 +269,16 @@ def main():
                 return
 
             df_feat = engineer_features_for_app(df)
-
             if df_feat.empty:
                 st.error("Not enough data after feature engineering.")
                 return
 
-            # TABS
             tab_summary, tab_charts, tab_signals, tab_model = st.tabs(
                 ["📌 Summary", "📊 Charts", "📋 Recent signals", "🧠 Model details"]
             )
 
+            # --------- RandomForest path ----------
             if algo.startswith("RandomForest"):
-                # ================= RF PIPELINE =================
                 clf, reg, feature_cols = load_rf_model(mode=mode)
                 if clf is None or reg is None:
                     return
@@ -361,7 +313,6 @@ def main():
                 latest_pred_return = float(latest_row["pred_return"])
                 direction_label = "UP" if latest_prob_up >= 0.5 else "DOWN / FLAT"
 
-                # --- SUMMARY TAB (RF) ---
                 with tab_summary:
                     st.subheader(f"Market pattern for `{ticker}` ({mode.upper()} – RandomForest)")
 
@@ -374,22 +325,23 @@ def main():
                     else:
                         st.markdown(f"### {pattern}")
 
-                    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-                    mcol1.metric("Last close", f"${latest_close:,.2f}")
-                    mcol2.metric("Prob. of UP", f"{latest_prob_up:.1%}")
-                    mcol3.metric("RSI (14)", f"{latest_rsi:.1f}")
-                    mcol4.metric("Predicted move", f"{latest_pred_return * 100:+.2f}%")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Last close", f"${latest_close:,.2f}")
+                    c2.metric("Prob. of UP", f"{latest_prob_up:.1%}")
+                    c3.metric("RSI (14)", f"{latest_rsi:.1f}")
+                    c4.metric("Predicted move", f"{latest_pred_return * 100:+.2f}%")
 
                     st.markdown("### Latest bar prediction")
                     st.write(f"- **Bar time:** `{latest_index}`")
                     st.write(f"- **Model:** RandomForest ({mode.upper()})")
-                    st.write(f"- **Model expectation:** **{direction_label}** for the **{horizon_text}**")
+                    st.write(
+                        f"- **Model expectation:** **{direction_label}** for the **{horizon_text}**"
+                    )
                     st.write(f"- **Probability of UP:** `{latest_prob_up:.2%}`")
                     st.write(
                         f"- **Predicted price change:** `{latest_pred_return * 100:+.2f}%` ({horizon_text})"
                     )
 
-                # --- CHARTS TAB (RF & DL share the same price chart) ---
                 with tab_charts:
                     st.subheader("Price & moving averages")
                     fig, ax = plt.subplots(figsize=(10, 4))
@@ -411,7 +363,6 @@ def main():
                     ax2.set_ylabel("RSI")
                     st.pyplot(fig2)
 
-                # --- RECENT SIGNALS TAB (RF) ---
                 with tab_signals:
                     st.subheader("Recent RandomForest outputs (last 15 bars)")
                     nice_df = (
@@ -431,7 +382,6 @@ def main():
                     )
                     st.dataframe(nice_df)
 
-                # --- MODEL DETAILS TAB (RF) ---
                 with tab_model:
                     st.subheader("RandomForest model details")
                     st.markdown(
@@ -439,21 +389,21 @@ def main():
 **Mode:** `{mode.upper()}`  
 **Horizon:** `{horizon_text}`  
 
-Uses:
-- RandomForestClassifier → predicts UP/DOWN
-- RandomForestRegressor → predicts next_return (% move)
+Models:
+- RandomForestClassifier → UP/DOWN  
+- RandomForestRegressor → next_return (% move)  
 
 Features:
-- Returns: return_1d, return_2d, return_5d
-- MAs: ma_5, ma_10, ma_20
-- MA ratios: ma_5_20_ratio, ma_10_20_ratio
-- Volatility: vol_5, vol_10
+- Returns: return_1d, return_2d, return_5d  
+- MAs: ma_5, ma_10, ma_20  
+- MA ratios: ma_5_20_ratio, ma_10_20_ratio  
+- Volatility: vol_5, vol_10  
 - RSI(14)
 """
                     )
 
+            # --------- Deep Learning path ----------
             else:
-                # ================= DL PIPELINE =================
                 model, meta = load_dl_model()
                 if model is None or meta is None:
                     return
@@ -473,10 +423,7 @@ Features:
                     )
                     return
 
-                # Scale using training scaler
                 X_scaled = scaler.transform(X_raw)
-
-                # Build sequences for ALL available windows
                 X_seq = build_sequences_for_app(X_scaled, window=window)
                 if X_seq.shape[0] == 0:
                     st.error(
@@ -484,14 +431,11 @@ Features:
                     )
                     return
 
-                # Predict for all sequences
                 dir_probs, mag_preds = model.predict(X_seq)
                 dir_probs = dir_probs.ravel()
                 mag_preds = mag_preds.ravel()
                 dir_preds = (dir_probs >= 0.5).astype(int)
 
-                # Align predictions with df_feat index
-                # First 'window' rows don't have predictions
                 df_feat_dl = df_feat.copy()
                 df_feat_dl["dl_pred_up"] = np.nan
                 df_feat_dl["dl_prob_up"] = np.nan
@@ -501,8 +445,10 @@ Features:
                 df_feat_dl.iloc[window:, df_feat_dl.columns.get_loc("dl_prob_up")] = dir_probs
                 df_feat_dl.iloc[window:, df_feat_dl.columns.get_loc("dl_pred_return")] = mag_preds
 
-                # Use last available row with predictions
-                df_valid = df_feat_dl.dropna(subset=["dl_prob_up", "dl_pred_return"])
+                # ✅ No dropna(subset=...) – use mask instead to avoid KeyError
+                valid_mask = df_feat_dl["dl_prob_up"].notna() & df_feat_dl["dl_pred_return"].notna()
+                df_valid = df_feat_dl[valid_mask]
+
                 if df_valid.empty:
                     st.error("No valid DL predictions found after alignment.")
                     return
@@ -519,7 +465,6 @@ Features:
                 preds_valid = df_valid["dl_pred_up"].values
                 pattern = get_pattern_label(preds_valid, closes_valid)
 
-                # --- SUMMARY TAB (DL) ---
                 with tab_summary:
                     st.subheader(f"Market pattern for `{ticker}` (DAILY – LSTM)")
 
@@ -532,22 +477,23 @@ Features:
                     else:
                         st.markdown(f"### {pattern}")
 
-                    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-                    mcol1.metric("Last close", f"${latest_close:,.2f}")
-                    mcol2.metric("Prob. of UP", f"{latest_prob_up:.1%}")
-                    mcol3.metric("RSI (14)", f"{latest_rsi:.1f}")
-                    mcol4.metric("Predicted move", f"{latest_pred_return * 100:+.2f}%")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Last close", f"${latest_close:,.2f}")
+                    c2.metric("Prob. of UP", f"{latest_prob_up:.1%}")
+                    c3.metric("RSI (14)", f"{latest_rsi:.1f}")
+                    c4.metric("Predicted move", f"{latest_pred_return * 100:+.2f}%")
 
                     st.markdown("### Latest bar prediction (LSTM)")
                     st.write(f"- **Bar time:** `{latest_index}`")
                     st.write(f"- **Model:** LSTM (Deep Learning, DAILY)")
-                    st.write(f"- **Model expectation:** **{direction_label}** for the **next day**")
+                    st.write(
+                        f"- **Model expectation:** **{direction_label}** for the **next day**"
+                    )
                     st.write(f"- **Probability of UP:** `{latest_prob_up:.2%}`")
                     st.write(
                         f"- **Predicted price change:** `{latest_pred_return * 100:+.2f}%` (next day)"
                     )
 
-                # --- CHARTS TAB (same as RF) ---
                 with tab_charts:
                     st.subheader("Price & moving averages")
                     fig, ax = plt.subplots(figsize=(10, 4))
@@ -569,7 +515,6 @@ Features:
                     ax2.set_ylabel("RSI")
                     st.pyplot(fig2)
 
-                # --- RECENT SIGNALS TAB (DL) ---
                 with tab_signals:
                     st.subheader("Recent LSTM outputs (last 15 bars with predictions)")
                     recent = (
@@ -589,7 +534,6 @@ Features:
                     )
                     st.dataframe(recent)
 
-                # --- MODEL DETAILS TAB (DL) ---
                 with tab_model:
                     st.subheader("LSTM (Deep Learning) model details")
                     st.markdown(
@@ -604,28 +548,23 @@ Architecture:
   - `direction` (sigmoid) → UP/DOWN
   - `magnitude` (linear) → next_return (decimal)
 
-Loss:
-- Binary cross-entropy (direction)
-- MSE (magnitude)
-- Joint training with loss weights (1.0, 0.5)
-
 Features (same as RandomForest):
-- Returns: return_1d, return_2d, return_5d
-- MAs: ma_5, ma_10, ma_20
-- MA ratios: ma_5_20_ratio, ma_10_20_ratio
-- Volatility: vol_5, vol_10
+- Returns: return_1d, return_2d, return_5d  
+- MAs: ma_5, ma_10, ma_20  
+- MA ratios: ma_5_20_ratio, ma_10_20_ratio  
+- Volatility: vol_5, vol_10  
 - RSI(14)
 
 Input to LSTM:
 - Sliding window of length `{window}` bars,
-  scaled with StandardScaler fitted during training.
+  scaled using the StandardScaler fitted during training.
 """
                     )
 
     st.markdown("---")
     st.caption(
-        "Portfolio project – demonstrates classic ML vs deep learning on financial time series, "
-        "with live data, feature engineering, and interactive visualization."
+        "Portfolio project – compares classic ML vs deep learning on financial time series "
+        "with live data and interactive visualization."
     )
 
 
