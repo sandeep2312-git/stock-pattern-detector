@@ -1,7 +1,8 @@
 streamlit
 yfinance
 pandas
-numpy
+numpynumpy==1.26.4
+tensorflow==2.15.0  # or whatever version you installed
 scikit-learn
 joblib
 matplotlib
