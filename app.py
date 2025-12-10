@@ -6,8 +6,16 @@ import joblib
 import os
 import matplotlib.pyplot as plt
 
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+
+# Paths for classic ML models
 DAILY_MODEL_PATH = "models/saved_model.pkl"
 HOURLY_MODEL_PATH = "models/saved_model_hourly.pkl"
+
+# Paths for deep learning model
+DL_MODEL_DIR = "models/dl_model"
+DL_META_PATH = "models/dl_meta.pkl"
 
 
 # ---------- RSI CALCULATION ----------
@@ -29,12 +37,13 @@ def compute_rsi(series, period=14):
     return rsi
 
 
-# ---------- FEATURE ENGINEERING FOR APP ----------
+# ---------- FEATURE ENGINEERING (shared) ----------
 def engineer_features_for_app(df: pd.DataFrame) -> pd.DataFrame:
     """
     Create the SAME features as used during training in:
     - train_model.py (daily)
     - train_model_hourly.py (hourly)
+    - train_model_dl.py (deep learning, daily)
 
     Here, "d" in return_1d, etc., just means "1 bar"
     (1 day for daily mode, 1 hour for hourly mode).
@@ -74,8 +83,36 @@ def engineer_features_for_app(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ---------- MODEL LOADING ----------
-def load_model(mode: str = "daily"):
+# ---------- PATTERN DETECTION ----------
+def get_pattern_label(preds, closes):
+    """
+    Use recent predictions + price slope to label the pattern.
+    preds: array-like of 0/1 direction predictions
+    closes: array-like of prices, aligned with preds
+    """
+    preds = np.array(preds)
+    closes = np.array(closes)
+
+    if len(preds) < 5 or len(closes) < 10:
+        return "Not enough data"
+
+    last5 = preds[-5:]
+    ones_ratio = last5.mean()  # avg of last 5 predicted up(1)/down(0)
+
+    last_prices = closes[-10:]
+    x = np.arange(len(last_prices))
+    slope = np.polyfit(x, last_prices, 1)[0]
+
+    if ones_ratio > 0.6 and slope > 0:
+        return "UPTREND / BULLISH"
+    elif ones_ratio < 0.4 and slope < 0:
+        return "DOWNTREND / BEARISH"
+    else:
+        return "SIDEWAYS / NEUTRAL"
+
+
+# ---------- LOAD RANDOMFOREST MODELS ----------
+def load_rf_model(mode: str = "daily"):
     """
     mode: "daily" or "hourly"
     """
@@ -83,7 +120,7 @@ def load_model(mode: str = "daily"):
 
     if not os.path.exists(model_path):
         st.error(
-            f"Model not found for mode={mode}. "
+            f"RandomForest model not found for mode={mode}. "
             f"Expected file: {model_path}. "
             "Please run the appropriate training script and commit the model."
         )
@@ -105,30 +142,38 @@ def load_model(mode: str = "daily"):
     return clf, reg, feature_cols
 
 
-# ---------- PATTERN DETECTION ----------
-def get_pattern_label(preds, closes):
+# ---------- LOAD DEEP LEARNING MODEL ----------
+@st.cache_resource
+def load_dl_model():
     """
-    Use recent predictions + price slope to label the pattern.
+    Load the LSTM deep learning model and metadata.
     """
-    if len(preds) < 5:
-        return "Not enough data"
+    if (not os.path.exists(DL_MODEL_DIR)) or (not os.path.exists(DL_META_PATH)):
+        st.error(
+            f"Deep learning model not found. "
+            f"Expected: {DL_MODEL_DIR} and {DL_META_PATH}. "
+            "Run train_model_dl.py first."
+        )
+        return None, None
 
-    last5 = np.array(preds[-5:])
-    ones_ratio = last5.mean()  # avg of last 5 predicted up(1)/down(0)
+    model = load_model(DL_MODEL_DIR)
+    meta = joblib.load(DL_META_PATH)
 
-    last_prices = closes[-10:]
-    if len(last_prices) < 2:
-        return "Not enough price history"
+    return model, meta
 
-    x = np.arange(len(last_prices))
-    slope = np.polyfit(x, last_prices, 1)[0]
 
-    if ones_ratio > 0.6 and slope > 0:
-        return "UPTREND / BULLISH"
-    elif ones_ratio < 0.4 and slope < 0:
-        return "DOWNTREND / BEARISH"
-    else:
-        return "SIDEWAYS / NEUTRAL"
+def build_sequences_for_app(X_scaled: np.ndarray, window: int):
+    """
+    Build sliding window sequences over X_scaled.
+    Returns:
+    - X_seq: (num_samples, window, num_features)
+    """
+    seqs = []
+    for i in range(window, len(X_scaled)):
+        seqs.append(X_scaled[i - window : i])
+    if not seqs:
+        return np.empty((0, window, X_scaled.shape[1]))
+    return np.array(seqs)
 
 
 # ---------- STREAMLIT APP ----------
@@ -139,69 +184,65 @@ def main():
         layout="wide",
     )
 
-    # Small CSS tweak for nicer look
-    st.markdown(
-        """
-        <style>
-        .big-metric {
-            font-size: 1.4rem;
-            font-weight: 600;
-        }
-        .small-label {
-            font-size: 0.8rem;
-            color: #777777;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.title("📈 Stock Pattern Detector")
+    st.title("📈 Stock Pattern Detector – v2 (ML + Deep Learning)")
     st.caption(
-        "ML-based daily & hourly stock signals – direction (UP/DOWN) "
-        "and expected % move based on technical patterns."
+        "Daily & hourly stock signals with RandomForest and LSTM (deep learning). "
+        "Direction (UP/DOWN) and expected % move based on technical patterns."
     )
 
-    # Sidebar info / help
-    st.sidebar.title("ℹ️ How this works")
+    # Sidebar info
+    st.sidebar.title("ℹ️ About this app")
     st.sidebar.markdown(
         """
-This app trains **two models per timeframe**:
+**Models:**
+- **RandomForest (Classic ML)** – daily & hourly
+- **LSTM (Deep Learning)** – daily only
 
-- A **classifier** → predicts if the next bar is **UP** or **DOWN/FLAT**
-- A **regressor** → predicts the approximate **% price move**
+**Targets:**
+- Direction: **UP (1)** vs **DOWN/FLAT (0)**
+- Magnitude: approximate **% move next bar**
 
-It uses:
+**Features:**
 - Returns (1, 2, 5 bars)
 - Moving averages (5 / 10 / 20)
+- MA ratios (trend)
 - Volatility
 - RSI (14)
 
-You can switch between:
-- **Daily mode** → prediction for the **next trading day**
-- **Hourly mode** → prediction for the **next 1-hour bar**
-
-> 🔒 **Disclaimer:** This is **educational only**, not financial advice.
+> ⚠️ For learning/demo only, **not** financial advice.
 """
     )
 
-    # Timeframe + inputs
-    timeframe = st.radio(
-        "Prediction timeframe",
-        ["Daily (next day)", "Hourly (next hour)"],
-        index=0,
-        horizontal=True,
-    )
-    mode = "daily" if timeframe.startswith("Daily") else "hourly"
-    horizon_text = "next day" if mode == "daily" else "next hour"
+    # Controls
+    col_top1, col_top2 = st.columns([1.2, 1])
 
-    clf, reg, feature_cols = load_model(mode=mode)
-    if clf is None or reg is None:
-        return
+    with col_top1:
+        timeframe = st.radio(
+            "Prediction timeframe",
+            ["Daily (next day)", "Hourly (next hour)"],
+            index=0,
+            horizontal=True,
+        )
+        mode = "daily" if timeframe.startswith("Daily") else "hourly"
+        horizon_text = "next day" if mode == "daily" else "next hour"
 
-    col1, col2 = st.columns([1.2, 1])
+    with col_top2:
+        algo = st.radio(
+            "Model type",
+            ["RandomForest (Classic ML)", "LSTM (Deep Learning)"],
+            index=0,
+            horizontal=True,
+        )
 
-    with col1:
+    # For now, LSTM only supports daily
+    if algo.startswith("LSTM") and mode == "hourly":
+        st.warning("Deep Learning (LSTM) is currently available only in DAILY mode.")
+        mode = "daily"
+        horizon_text = "next day"
+
+    col_input1, col_input2 = st.columns([1.2, 1])
+
+    with col_input1:
         common_tickers = [
             "AAPL",
             "MSFT",
@@ -241,12 +282,12 @@ You can switch between:
         custom_ticker = st.text_input("Or type a custom ticker:", "")
         ticker = custom_ticker.strip().upper() if custom_ticker.strip() else selected_ticker
 
-    with col2:
+    with col_input2:
         if mode == "daily":
             period = st.selectbox(
                 "Historical period:",
-                ["6mo", "1y", "2y", "5y"],
-                index=1,
+                ["6mo", "1y", "2y", "5y", "10y"],
+                index=2,
             )
         else:
             period = "60d"
@@ -256,9 +297,10 @@ You can switch between:
 
     if st.button("🔍 Run analysis", type="primary"):
         with st.spinner(
-            f"Fetching data for **{ticker}** and running predictions ({mode.upper()})..."
+            f"Fetching data for **{ticker}** and running predictions "
+            f"({mode.upper()} • {algo.split()[0]})..."
         ):
-            # Choose interval and effective period based on mode
+            # Choose interval and effective period
             if mode == "daily":
                 yf_interval = "1d"
                 yf_period = period
@@ -278,186 +320,312 @@ You can switch between:
                 st.error("Not enough data after feature engineering.")
                 return
 
-            # Build feature matrix that matches model
-            try:
-                X_latest = df_feat[feature_cols]
-            except KeyError:
-                missing_cols = [c for c in feature_cols if c not in df_feat.columns]
-                st.error(
-                    "Feature mismatch between training and app.\n\n"
-                    f"Missing features in app: `{missing_cols}`.\n"
-                    "Make sure engineer_features_for_app() matches both training scripts."
-                )
-                return
-
-            # Classification: direction (UP/DOWN)
-            preds = clf.predict(X_latest)
-            proba = clf.predict_proba(X_latest)[:, 1]
-
-            # Regression: magnitude of move (next bar return)
-            pred_returns = reg.predict(X_latest)  # decimal, e.g., 0.0123 = +1.23%
-
-            df_feat["pred_up"] = preds
-            df_feat["prob_up"] = proba
-            df_feat["pred_return"] = pred_returns
-
-            closes = df_feat["Close"].values
-            pattern = get_pattern_label(preds, closes)
-
-            latest_row = df_feat.iloc[-1]
-            latest_index = latest_row.name  # Timestamp (date or date+time)
-            latest_close = float(latest_row["Close"])
-            latest_rsi = float(latest_row["rsi_14"])
-            latest_prob_up = float(latest_row["prob_up"])
-            latest_pred_return = float(latest_row["pred_return"])
-            direction_label = "UP" if latest_prob_up >= 0.5 else "DOWN / FLAT"
-
-            # ---------- TABS ----------
+            # TABS
             tab_summary, tab_charts, tab_signals, tab_model = st.tabs(
                 ["📌 Summary", "📊 Charts", "📋 Recent signals", "🧠 Model details"]
             )
 
-            # --- SUMMARY TAB ---
-            with tab_summary:
-                # High-level pattern
-                st.subheader(f"Market pattern for `{ticker}` ({mode.upper()})")
+            if algo.startswith("RandomForest"):
+                # ================= RF PIPELINE =================
+                clf, reg, feature_cols = load_rf_model(mode=mode)
+                if clf is None or reg is None:
+                    return
 
-                if "UPTREND" in pattern:
-                    st.markdown(f"### 🟢 {pattern}")
-                elif "DOWNTREND" in pattern:
-                    st.markdown(f"### 🔴 {pattern}")
-                elif "SIDEWAYS" in pattern:
-                    st.markdown(f"### 🟡 {pattern}")
-                else:
-                    st.markdown(f"### {pattern}")
-
-                st.markdown(
-                    f"""
-The model sees **{ticker}** as:
-
-- Short-term pattern: **{pattern}**  
-- Timeframe: **{mode.upper()}** → prediction for the **{horizon_text}**
-"""
-                )
-
-                # Metrics row
-                mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-                mcol1.markdown(
-                    f"<div class='small-label'>Last close</div>"
-                    f"<div class='big-metric'>${latest_close:,.2f}</div>",
-                    unsafe_allow_html=True,
-                )
-                mcol2.markdown(
-                    f"<div class='small-label'>Prob. of UP ({horizon_text})</div>"
-                    f"<div class='big-metric'>{latest_prob_up:.1%}</div>",
-                    unsafe_allow_html=True,
-                )
-                mcol3.markdown(
-                    f"<div class='small-label'>RSI (14)</div>"
-                    f"<div class='big-metric'>{latest_rsi:.1f}</div>",
-                    unsafe_allow_html=True,
-                )
-                mcol4.markdown(
-                    f"<div class='small-label'>Predicted move ({horizon_text})</div>"
-                    f"<div class='big-metric'>{latest_pred_return * 100:+.2f}%</div>",
-                    unsafe_allow_html=True,
-                )
-
-                st.markdown("### Latest bar prediction")
-                st.write(f"- **Bar time:** `{latest_index}`")
-                st.write(f"- **Close price:** `${latest_close:,.2f}`")
-                st.write(
-                    f"- **Model expectation:** **{direction_label}** for the **{horizon_text}**"
-                )
-                st.write(f"- **Probability of UP:** `{latest_prob_up:.2%}`")
-                st.write(
-                    f"- **Predicted price change:** `{latest_pred_return * 100:+.2f}%` ({horizon_text})"
-                )
-
-                st.markdown(
-                    """
-**How to interpret this:**
-
-- If **Prob. of UP** is close to **1.0 / 100%**, the model is strongly bullish for the next bar.  
-- If it’s near **0**, the model is strongly bearish/flat.  
-- The **Predicted move** is the expected percentage change from the current bar to the next.
-"""
-                )
-
-            # --- CHARTS TAB ---
-            with tab_charts:
-                st.subheader("Price & moving averages")
-                fig, ax = plt.subplots(figsize=(10, 4))
-                ax.plot(df_feat.index, df_feat["Close"], label="Close")
-                ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
-                ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
-                ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
-                ax.set_xlabel("Time")
-                ax.set_ylabel("Price")
-                ax.legend()
-                st.pyplot(fig)
-
-                st.subheader("RSI (14)")
-                fig2, ax2 = plt.subplots(figsize=(10, 2.5))
-                ax2.plot(df_feat.index, df_feat["rsi_14"], label="RSI 14")
-                ax2.axhline(70, linestyle="--")
-                ax2.axhline(30, linestyle="--")
-                ax2.set_ylim(0, 100)
-                ax2.set_ylabel("RSI")
-                st.pyplot(fig2)
-
-            # --- RECENT SIGNALS TAB ---
-            with tab_signals:
-                st.subheader("Recent model outputs (last 15 bars)")
-                nice_df = (
-                    df_feat[
-                        ["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]
-                    ]
-                    .tail(15)
-                    .rename(
-                        columns={
-                            "Close": "Close price",
-                            "rsi_14": "RSI (14)",
-                            "pred_up": "Pred. up? (1=yes)",
-                            "prob_up": "Prob. of up",
-                            "pred_return": "Pred. return (decimal)",
-                        }
+                try:
+                    X_all = df_feat[feature_cols]
+                except KeyError:
+                    missing_cols = [c for c in feature_cols if c not in df_feat.columns]
+                    st.error(
+                        "Feature mismatch between training and app.\n\n"
+                        f"Missing features in app: `{missing_cols}`.\n"
+                        "Make sure engineer_features_for_app() matches training scripts."
                     )
-                )
-                st.dataframe(nice_df)
+                    return
 
-            # --- MODEL DETAILS TAB ---
-            with tab_model:
-                st.subheader("Model & features")
-                st.markdown(
-                    f"""
-**Current mode:** `{mode.upper()}`  
+                preds = clf.predict(X_all)
+                proba = clf.predict_proba(X_all)[:, 1]
+                pred_returns = reg.predict(X_all)
+
+                df_feat["pred_up"] = preds
+                df_feat["prob_up"] = proba
+                df_feat["pred_return"] = pred_returns
+
+                closes = df_feat["Close"].values
+                pattern = get_pattern_label(preds, closes)
+
+                latest_row = df_feat.iloc[-1]
+                latest_index = latest_row.name
+                latest_close = float(latest_row["Close"])
+                latest_rsi = float(latest_row["rsi_14"])
+                latest_prob_up = float(latest_row["prob_up"])
+                latest_pred_return = float(latest_row["pred_return"])
+                direction_label = "UP" if latest_prob_up >= 0.5 else "DOWN / FLAT"
+
+                # --- SUMMARY TAB (RF) ---
+                with tab_summary:
+                    st.subheader(f"Market pattern for `{ticker}` ({mode.upper()} – RandomForest)")
+
+                    if "UPTREND" in pattern:
+                        st.markdown(f"### 🟢 {pattern}")
+                    elif "DOWNTREND" in pattern:
+                        st.markdown(f"### 🔴 {pattern}")
+                    elif "SIDEWAYS" in pattern:
+                        st.markdown(f"### 🟡 {pattern}")
+                    else:
+                        st.markdown(f"### {pattern}")
+
+                    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+                    mcol1.metric("Last close", f"${latest_close:,.2f}")
+                    mcol2.metric("Prob. of UP", f"{latest_prob_up:.1%}")
+                    mcol3.metric("RSI (14)", f"{latest_rsi:.1f}")
+                    mcol4.metric("Predicted move", f"{latest_pred_return * 100:+.2f}%")
+
+                    st.markdown("### Latest bar prediction")
+                    st.write(f"- **Bar time:** `{latest_index}`")
+                    st.write(f"- **Model:** RandomForest ({mode.upper()})")
+                    st.write(f"- **Model expectation:** **{direction_label}** for the **{horizon_text}**")
+                    st.write(f"- **Probability of UP:** `{latest_prob_up:.2%}`")
+                    st.write(
+                        f"- **Predicted price change:** `{latest_pred_return * 100:+.2f}%` ({horizon_text})"
+                    )
+
+                # --- CHARTS TAB (RF & DL share the same price chart) ---
+                with tab_charts:
+                    st.subheader("Price & moving averages")
+                    fig, ax = plt.subplots(figsize=(10, 4))
+                    ax.plot(df_feat.index, df_feat["Close"], label="Close")
+                    ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
+                    ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
+                    ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
+                    ax.set_xlabel("Time")
+                    ax.set_ylabel("Price")
+                    ax.legend()
+                    st.pyplot(fig)
+
+                    st.subheader("RSI (14)")
+                    fig2, ax2 = plt.subplots(figsize=(10, 2.5))
+                    ax2.plot(df_feat.index, df_feat["rsi_14"], label="RSI 14")
+                    ax2.axhline(70, linestyle="--")
+                    ax2.axhline(30, linestyle="--")
+                    ax2.set_ylim(0, 100)
+                    ax2.set_ylabel("RSI")
+                    st.pyplot(fig2)
+
+                # --- RECENT SIGNALS TAB (RF) ---
+                with tab_signals:
+                    st.subheader("Recent RandomForest outputs (last 15 bars)")
+                    nice_df = (
+                        df_feat[
+                            ["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]
+                        ]
+                        .tail(15)
+                        .rename(
+                            columns={
+                                "Close": "Close price",
+                                "rsi_14": "RSI (14)",
+                                "pred_up": "Pred. up? (1=yes)",
+                                "prob_up": "Prob. of up",
+                                "pred_return": "Pred. return (decimal)",
+                            }
+                        )
+                    )
+                    st.dataframe(nice_df)
+
+                # --- MODEL DETAILS TAB (RF) ---
+                with tab_model:
+                    st.subheader("RandomForest model details")
+                    st.markdown(
+                        f"""
+**Mode:** `{mode.upper()}`  
 **Horizon:** `{horizon_text}`  
 
-**Features used:**
+Uses:
+- RandomForestClassifier → predicts UP/DOWN
+- RandomForestRegressor → predicts next_return (% move)
 
-- Returns: `return_1d`, `return_2d`, `return_5d`
-- Moving averages: `ma_5`, `ma_10`, `ma_20`
-- MA ratios: `ma_5_20_ratio`, `ma_10_20_ratio`
-- Volatility: `vol_5`, `vol_10`
-- Momentum: `rsi_14`
-
-Two models are trained:
-
-1. **RandomForestClassifier** → predicts `UP` (1) vs `DOWN/FLAT` (0)  
-2. **RandomForestRegressor** → predicts `next_return` (decimal % move)
-
-The app is designed as a **learning / demo tool** to showcase:
-- Feature engineering on price data  
-- Separate classification + regression heads  
-- A simple ML-powered trading dashboard UI.
+Features:
+- Returns: return_1d, return_2d, return_5d
+- MAs: ma_5, ma_10, ma_20
+- MA ratios: ma_5_20_ratio, ma_10_20_ratio
+- Volatility: vol_5, vol_10
+- RSI(14)
 """
-                )
+                    )
+
+            else:
+                # ================= DL PIPELINE =================
+                model, meta = load_dl_model()
+                if model is None or meta is None:
+                    return
+
+                feature_cols = meta["feature_cols"]
+                scaler = meta["scaler"]
+                window = meta["window"]
+
+                try:
+                    X_raw = df_feat[feature_cols].values
+                except KeyError:
+                    missing_cols = [c for c in feature_cols if c not in df_feat.columns]
+                    st.error(
+                        "Feature mismatch for DL model.\n\n"
+                        f"Missing features in app: `{missing_cols}`.\n"
+                        "Make sure engineer_features_for_app() matches train_model_dl.py."
+                    )
+                    return
+
+                # Scale using training scaler
+                X_scaled = scaler.transform(X_raw)
+
+                # Build sequences for ALL available windows
+                X_seq = build_sequences_for_app(X_scaled, window=window)
+                if X_seq.shape[0] == 0:
+                    st.error(
+                        f"Not enough data to form a sequence of length {window} for LSTM."
+                    )
+                    return
+
+                # Predict for all sequences
+                dir_probs, mag_preds = model.predict(X_seq)
+                dir_probs = dir_probs.ravel()
+                mag_preds = mag_preds.ravel()
+                dir_preds = (dir_probs >= 0.5).astype(int)
+
+                # Align predictions with df_feat index
+                # First 'window' rows don't have predictions
+                df_feat_dl = df_feat.copy()
+                df_feat_dl["dl_pred_up"] = np.nan
+                df_feat_dl["dl_prob_up"] = np.nan
+                df_feat_dl["dl_pred_return"] = np.nan
+
+                df_feat_dl.iloc[window:, df_feat_dl.columns.get_loc("dl_pred_up")] = dir_preds
+                df_feat_dl.iloc[window:, df_feat_dl.columns.get_loc("dl_prob_up")] = dir_probs
+                df_feat_dl.iloc[window:, df_feat_dl.columns.get_loc("dl_pred_return")] = mag_preds
+
+                # Use last available row with predictions
+                df_valid = df_feat_dl.dropna(subset=["dl_prob_up", "dl_pred_return"])
+                if df_valid.empty:
+                    st.error("No valid DL predictions found after alignment.")
+                    return
+
+                latest_row = df_valid.iloc[-1]
+                latest_index = latest_row.name
+                latest_close = float(latest_row["Close"])
+                latest_rsi = float(latest_row["rsi_14"])
+                latest_prob_up = float(latest_row["dl_prob_up"])
+                latest_pred_return = float(latest_row["dl_pred_return"])
+                direction_label = "UP" if latest_prob_up >= 0.5 else "DOWN / FLAT"
+
+                closes_valid = df_valid["Close"].values
+                preds_valid = df_valid["dl_pred_up"].values
+                pattern = get_pattern_label(preds_valid, closes_valid)
+
+                # --- SUMMARY TAB (DL) ---
+                with tab_summary:
+                    st.subheader(f"Market pattern for `{ticker}` (DAILY – LSTM)")
+
+                    if "UPTREND" in pattern:
+                        st.markdown(f"### 🟢 {pattern}")
+                    elif "DOWNTREND" in pattern:
+                        st.markdown(f"### 🔴 {pattern}")
+                    elif "SIDEWAYS" in pattern:
+                        st.markdown(f"### 🟡 {pattern}")
+                    else:
+                        st.markdown(f"### {pattern}")
+
+                    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+                    mcol1.metric("Last close", f"${latest_close:,.2f}")
+                    mcol2.metric("Prob. of UP", f"{latest_prob_up:.1%}")
+                    mcol3.metric("RSI (14)", f"{latest_rsi:.1f}")
+                    mcol4.metric("Predicted move", f"{latest_pred_return * 100:+.2f}%")
+
+                    st.markdown("### Latest bar prediction (LSTM)")
+                    st.write(f"- **Bar time:** `{latest_index}`")
+                    st.write(f"- **Model:** LSTM (Deep Learning, DAILY)")
+                    st.write(f"- **Model expectation:** **{direction_label}** for the **next day**")
+                    st.write(f"- **Probability of UP:** `{latest_prob_up:.2%}`")
+                    st.write(
+                        f"- **Predicted price change:** `{latest_pred_return * 100:+.2f}%` (next day)"
+                    )
+
+                # --- CHARTS TAB (same as RF) ---
+                with tab_charts:
+                    st.subheader("Price & moving averages")
+                    fig, ax = plt.subplots(figsize=(10, 4))
+                    ax.plot(df_feat.index, df_feat["Close"], label="Close")
+                    ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
+                    ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
+                    ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
+                    ax.set_xlabel("Time")
+                    ax.set_ylabel("Price")
+                    ax.legend()
+                    st.pyplot(fig)
+
+                    st.subheader("RSI (14)")
+                    fig2, ax2 = plt.subplots(figsize=(10, 2.5))
+                    ax2.plot(df_feat.index, df_feat["rsi_14"], label="RSI 14")
+                    ax2.axhline(70, linestyle="--")
+                    ax2.axhline(30, linestyle="--")
+                    ax2.set_ylim(0, 100)
+                    ax2.set_ylabel("RSI")
+                    st.pyplot(fig2)
+
+                # --- RECENT SIGNALS TAB (DL) ---
+                with tab_signals:
+                    st.subheader("Recent LSTM outputs (last 15 bars with predictions)")
+                    recent = (
+                        df_valid[
+                            ["Close", "rsi_14", "dl_pred_up", "dl_prob_up", "dl_pred_return"]
+                        ]
+                        .tail(15)
+                        .rename(
+                            columns={
+                                "Close": "Close price",
+                                "rsi_14": "RSI (14)",
+                                "dl_pred_up": "Pred. up? (1=yes)",
+                                "dl_prob_up": "Prob. of up",
+                                "dl_pred_return": "Pred. return (decimal)",
+                            }
+                        )
+                    )
+                    st.dataframe(recent)
+
+                # --- MODEL DETAILS TAB (DL) ---
+                with tab_model:
+                    st.subheader("LSTM (Deep Learning) model details")
+                    st.markdown(
+                        f"""
+**Mode:** `DAILY`  
+**Horizon:** `next day`  
+
+Architecture:
+- 2× LSTM layers (64 → 32 units)
+- Dropout (0.3)
+- Two heads:
+  - `direction` (sigmoid) → UP/DOWN
+  - `magnitude` (linear) → next_return (decimal)
+
+Loss:
+- Binary cross-entropy (direction)
+- MSE (magnitude)
+- Joint training with loss weights (1.0, 0.5)
+
+Features (same as RandomForest):
+- Returns: return_1d, return_2d, return_5d
+- MAs: ma_5, ma_10, ma_20
+- MA ratios: ma_5_20_ratio, ma_10_20_ratio
+- Volatility: vol_5, vol_10
+- RSI(14)
+
+Input to LSTM:
+- Sliding window of length `{window}` bars,
+  scaled with StandardScaler fitted during training.
+"""
+                    )
 
     st.markdown("---")
     st.caption(
-        "Built as a portfolio project – demonstrates applied ML, feature engineering, "
-        "and interactive visualization with Streamlit."
+        "Portfolio project – demonstrates classic ML vs deep learning on financial time series, "
+        "with live data, feature engineering, and interactive visualization."
     )
 
 
