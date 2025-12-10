@@ -139,39 +139,53 @@ def main():
         layout="wide",
     )
 
+    # Small CSS tweak for nicer look
+    st.markdown(
+        """
+        <style>
+        .big-metric {
+            font-size: 1.4rem;
+            font-weight: 600;
+        }
+        .small-label {
+            font-size: 0.8rem;
+            color: #777777;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.title("📈 Stock Pattern Detector")
+    st.caption(
+        "ML-based daily & hourly stock signals – direction (UP/DOWN) "
+        "and expected % move based on technical patterns."
+    )
+
     # Sidebar info / help
-    st.sidebar.title("ℹ️ About this app")
+    st.sidebar.title("ℹ️ How this works")
     st.sidebar.markdown(
         """
-This dashboard uses **two machine learning models** (per timeframe) trained on historical
-prices to predict:
+This app trains **two models per timeframe**:
 
-1. Whether the next bar is more likely to be **UP or DOWN/FLAT**  
-2. By approximately **how much (%)** the price might move  
+- A **classifier** → predicts if the next bar is **UP** or **DOWN/FLAT**
+- A **regressor** → predicts the approximate **% price move**
 
-You can choose:
-- **Daily mode** → predicts **next day**  
-- **Hourly mode** → predicts **next 1-hour bar**  
+It uses:
+- Returns (1, 2, 5 bars)
+- Moving averages (5 / 10 / 20)
+- Volatility
+- RSI (14)
 
-**Key terms:**
-- **RSI (14)**: momentum (0–100).  
-  - >70 → overbought  
-  - <30 → oversold  
-- **Prob. of UP**: model’s confidence that the next bar closes higher.  
-- **Predicted move**: expected % price change for the next bar.  
-- **Pattern**: based on recent predictions + price slope  
-  (Uptrend / Downtrend / Sideways).
+You can switch between:
+- **Daily mode** → prediction for the **next trading day**
+- **Hourly mode** → prediction for the **next 1-hour bar**
 
-⚠️ This is **educational only**, **not financial advice**.
+> 🔒 **Disclaimer:** This is **educational only**, not financial advice.
 """
     )
 
-    st.title("📈 Stock Pattern Detector (ML-Powered)")
-    st.caption(
-        "Short-term directional signal + predicted % move based on historical price patterns."
-    )
-
-    # Timeframe toggle
+    # Timeframe + inputs
     timeframe = st.radio(
         "Prediction timeframe",
         ["Daily (next day)", "Hourly (next hour)"],
@@ -185,8 +199,8 @@ You can choose:
     if clf is None or reg is None:
         return
 
-    # --- Inputs ---
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns([1.2, 1])
+
     with col1:
         common_tickers = [
             "AAPL",
@@ -228,26 +242,29 @@ You can choose:
         ticker = custom_ticker.strip().upper() if custom_ticker.strip() else selected_ticker
 
     with col2:
-        period = st.selectbox(
-            "Historical period (for DAILY mode):",
-            ["6mo", "1y", "2y", "5y"],
-            index=1,
-        )
+        if mode == "daily":
+            period = st.selectbox(
+                "Historical period:",
+                ["6mo", "1y", "2y", "5y"],
+                index=1,
+            )
+        else:
+            period = "60d"
+            st.write("Historical period (hourly): `60d` (intraday limit)")
 
     st.markdown("---")
 
-    if st.button("🔍 Analyze"):
+    if st.button("🔍 Run analysis", type="primary"):
         with st.spinner(
             f"Fetching data for **{ticker}** and running predictions ({mode.upper()})..."
         ):
             # Choose interval and effective period based on mode
             if mode == "daily":
                 yf_interval = "1d"
-                yf_period = period  # "6mo", "1y", etc.
+                yf_period = period
             else:
                 yf_interval = "60m"
-                # Intraday is limited; map longer choices to 30–60 days
-                yf_period = "60d"  # good default for hourly
+                yf_period = "60d"
 
             df = yf.download(ticker, period=yf_period, interval=yf_interval)
 
@@ -261,7 +278,7 @@ You can choose:
                 st.error("Not enough data after feature engineering.")
                 return
 
-            # Try to build feature matrix that matches model
+            # Build feature matrix that matches model
             try:
                 X_latest = df_feat[feature_cols]
             except KeyError:
@@ -295,120 +312,152 @@ You can choose:
             latest_pred_return = float(latest_row["pred_return"])
             direction_label = "UP" if latest_prob_up >= 0.5 else "DOWN / FLAT"
 
-            # --- High-level pattern summary ---
-            st.subheader(f"Market pattern for `{ticker}` ({mode.upper()})")
-            if "UPTREND" in pattern:
-                st.markdown(f"### 🟢 {pattern}")
-            elif "DOWNTREND" in pattern:
-                st.markdown(f"### 🔴 {pattern}")
-            elif "SIDEWAYS" in pattern:
-                st.markdown(f"### 🟡 {pattern}")
-            else:
-                st.markdown(f"### {pattern}")
+            # ---------- TABS ----------
+            tab_summary, tab_charts, tab_signals, tab_model = st.tabs(
+                ["📌 Summary", "📊 Charts", "📋 Recent signals", "🧠 Model details"]
+            )
 
-            st.markdown(
-                f"""
-**Interpretation:**
+            # --- SUMMARY TAB ---
+            with tab_summary:
+                # High-level pattern
+                st.subheader(f"Market pattern for `{ticker}` ({mode.upper()})")
 
-- The model sees the recent pattern for **{ticker}** as: **{pattern}**  
-- This is based on the last few bars of predicted up/down moves  
-  **and** the slope of the recent price trend.
+                if "UPTREND" in pattern:
+                    st.markdown(f"### 🟢 {pattern}")
+                elif "DOWNTREND" in pattern:
+                    st.markdown(f"### 🔴 {pattern}")
+                elif "SIDEWAYS" in pattern:
+                    st.markdown(f"### 🟡 {pattern}")
+                else:
+                    st.markdown(f"### {pattern}")
+
+                st.markdown(
+                    f"""
+The model sees **{ticker}** as:
+
+- Short-term pattern: **{pattern}**  
+- Timeframe: **{mode.upper()}** → prediction for the **{horizon_text}**
 """
-            )
-
-            # --- Key metrics row ---
-            mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-            mcol1.metric("Last close", f"${latest_close:,.2f}")
-            mcol2.metric(f"Prob. of UP ({horizon_text})", f"{latest_prob_up:.1%}")
-            mcol3.metric("RSI (14)", f"{latest_rsi:.1f}")
-            mcol4.metric(
-                f"Predicted move ({horizon_text})",
-                f"{latest_pred_return * 100:+.2f}%",
-            )
-
-            # --- Latest prediction details ---
-            st.subheader(f"Latest prediction ({horizon_text} direction & move)")
-            st.write(f"- **Bar time:** `{latest_index}`")
-            st.write(f"- **Close price:** `${latest_close:,.2f}`")
-            st.write(f"- **Model expectation:** **{direction_label}** for the {horizon_text}")
-            st.write(f"- **Probability of UP:** `{latest_prob_up:.2%}`")
-            st.write(
-                f"- **Predicted price change:** `{latest_pred_return * 100:+.2f}%` ({horizon_text})"
-            )
-
-            st.markdown(
-                f"""
-**How to read this:**
-
-- In **{mode.upper()} mode**, the model looks at the past bars and predicts the **next {horizon_text}**.  
-- If **Prob. of UP** is closer to **1.0 / 100%**, the model is more confident
-  that the next bar will close **higher** than the current one.
-- The **Predicted move** is the expected percentage change in price from the current bar to the next.
-"""
-            )
-
-            # --- Chart: Price & Moving Averages ---
-            st.subheader("Price and moving averages")
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(df_feat.index, df_feat["Close"], label="Close price")
-            ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
-            ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
-            ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
-            ax.set_xlabel("Time")
-            ax.set_ylabel("Price")
-            ax.legend()
-            st.pyplot(fig)
-
-            # --- Recent predictions table ---
-            st.subheader("Recent model outputs (last 10 bars)")
-            st.dataframe(
-                df_feat[
-                    ["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]
-                ]
-                .tail(10)
-                .rename(
-                    columns={
-                        "Close": "Close price",
-                        "rsi_14": "RSI (14)",
-                        "pred_up": "Predicted up? (1=yes)",
-                        "prob_up": "Prob. of up",
-                        "pred_return": "Pred. return (decimal)",
-                    }
                 )
-            )
 
-            # --- Explanation section ---
-            with st.expander("📘 What do these numbers mean?"):
+                # Metrics row
+                mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+                mcol1.markdown(
+                    f"<div class='small-label'>Last close</div>"
+                    f"<div class='big-metric'>${latest_close:,.2f}</div>",
+                    unsafe_allow_html=True,
+                )
+                mcol2.markdown(
+                    f"<div class='small-label'>Prob. of UP ({horizon_text})</div>"
+                    f"<div class='big-metric'>{latest_prob_up:.1%}</div>",
+                    unsafe_allow_html=True,
+                )
+                mcol3.markdown(
+                    f"<div class='small-label'>RSI (14)</div>"
+                    f"<div class='big-metric'>{latest_rsi:.1f}</div>",
+                    unsafe_allow_html=True,
+                )
+                mcol4.markdown(
+                    f"<div class='small-label'>Predicted move ({horizon_text})</div>"
+                    f"<div class='big-metric'>{latest_pred_return * 100:+.2f}%</div>",
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown("### Latest bar prediction")
+                st.write(f"- **Bar time:** `{latest_index}`")
+                st.write(f"- **Close price:** `${latest_close:,.2f}`")
+                st.write(
+                    f"- **Model expectation:** **{direction_label}** for the **{horizon_text}**"
+                )
+                st.write(f"- **Probability of UP:** `{latest_prob_up:.2%}`")
+                st.write(
+                    f"- **Predicted price change:** `{latest_pred_return * 100:+.2f}%` ({horizon_text})"
+                )
+
                 st.markdown(
                     """
-**RSI (14)**  
-- Measures momentum on a 0–100 scale.  
-- **> 70** → overbought (price may cool down or pull back)  
-- **< 30** → oversold (price may bounce or recover)
+**How to interpret this:**
 
-**Predicted up? (1 / 0)**  
-- `1` → model predicts next bar close **higher**  
-- `0` → model predicts next bar close **lower or flat**
+- If **Prob. of UP** is close to **1.0 / 100%**, the model is strongly bullish for the next bar.  
+- If it’s near **0**, the model is strongly bearish/flat.  
+- The **Predicted move** is the expected percentage change from the current bar to the next.
+"""
+                )
 
-**Prob. of up**  
-- A probability between 0 and 1 (0–100%)  
-- Closer to 1 → stronger bullish bias  
-- Closer to 0 → stronger bearish/flat bias
+            # --- CHARTS TAB ---
+            with tab_charts:
+                st.subheader("Price & moving averages")
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.plot(df_feat.index, df_feat["Close"], label="Close")
+                ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
+                ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
+                ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
+                ax.set_xlabel("Time")
+                ax.set_ylabel("Price")
+                ax.legend()
+                st.pyplot(fig)
 
-**Pred. return (decimal)**  
-- Example: `0.0123` ≈ `+1.23%` expected price increase for the next bar  
-- `-0.0100` ≈ `-1.00%` expected price decrease for the next bar
+                st.subheader("RSI (14)")
+                fig2, ax2 = plt.subplots(figsize=(10, 2.5))
+                ax2.plot(df_feat.index, df_feat["rsi_14"], label="RSI 14")
+                ax2.axhline(70, linestyle="--")
+                ax2.axhline(30, linestyle="--")
+                ax2.set_ylim(0, 100)
+                ax2.set_ylabel("RSI")
+                st.pyplot(fig2)
 
-**Pattern label**  
-- **UPTREND / BULLISH** → recent predictions mostly up, price slope rising  
-- **DOWNTREND / BEARISH** → recent predictions mostly down, price slope falling  
-- **SIDEWAYS / NEUTRAL** → mixed predictions, flat-ish price action
+            # --- RECENT SIGNALS TAB ---
+            with tab_signals:
+                st.subheader("Recent model outputs (last 15 bars)")
+                nice_df = (
+                    df_feat[
+                        ["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]
+                    ]
+                    .tail(15)
+                    .rename(
+                        columns={
+                            "Close": "Close price",
+                            "rsi_14": "RSI (14)",
+                            "pred_up": "Pred. up? (1=yes)",
+                            "prob_up": "Prob. of up",
+                            "pred_return": "Pred. return (decimal)",
+                        }
+                    )
+                )
+                st.dataframe(nice_df)
+
+            # --- MODEL DETAILS TAB ---
+            with tab_model:
+                st.subheader("Model & features")
+                st.markdown(
+                    f"""
+**Current mode:** `{mode.upper()}`  
+**Horizon:** `{horizon_text}`  
+
+**Features used:**
+
+- Returns: `return_1d`, `return_2d`, `return_5d`
+- Moving averages: `ma_5`, `ma_10`, `ma_20`
+- MA ratios: `ma_5_20_ratio`, `ma_10_20_ratio`
+- Volatility: `vol_5`, `vol_10`
+- Momentum: `rsi_14`
+
+Two models are trained:
+
+1. **RandomForestClassifier** → predicts `UP` (1) vs `DOWN/FLAT` (0)  
+2. **RandomForestRegressor** → predicts `next_return` (decimal % move)
+
+The app is designed as a **learning / demo tool** to showcase:
+- Feature engineering on price data  
+- Separate classification + regression heads  
+- A simple ML-powered trading dashboard UI.
 """
                 )
 
     st.markdown("---")
     st.caption(
-        "Built for learning and portfolio demonstration. Not investment advice."
+        "Built as a portfolio project – demonstrates applied ML, feature engineering, "
+        "and interactive visualization with Streamlit."
     )
 
 
