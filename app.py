@@ -8,73 +8,25 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-# DL imports are optional — keep inside try so Streamlit Cloud doesn't crash
-try:
-    from tensorflow.keras.models import load_model
-except Exception:
-    load_model = None
-
 from feature_engineering import engineer_features, add_market_context
 
 # -------- Paths --------
 DAILY_MODEL_PATH = "models/saved_model.pkl"
 HOURLY_MODEL_PATH = "models/saved_model_hourly.pkl"
 
-DL_MODEL_DIR = "models/dl_model"
-DL_META_PATH = "models/dl_meta.pkl"
-
 TICKERS_CSV = Path("data") / "tickers.csv"
 PORTFOLIO_CSV = Path("data") / "portfolio.csv"
 
 
-# -------- Env detection --------
+# -------------------- helpers --------------------
 def is_streamlit_cloud() -> bool:
     return os.path.exists("/mount/src")
 
 
-# -------- UI helpers --------
-def prob_badge(p: float) -> str:
-    if p >= 0.60:
-        return "🟢 High"
-    if p >= 0.40:
-        return "🟡 Medium"
-    return "🔴 Low"
-
-
-def safe_float(x, default=np.nan) -> float:
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-
-def pred_range_from_history(df_feat: pd.DataFrame, pred_col: str = "pred_return", z: float = 1.5):
-    """
-    Simple uncertainty band using recent prediction dispersion (not a true CI).
-    """
-    if pred_col not in df_feat.columns:
-        return None
-    s = pd.to_numeric(df_feat[pred_col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-    if len(s) < 30:
-        return None
-    std = float(s.tail(120).std())  # last ~120 points
-    if not np.isfinite(std) or std <= 0:
-        return None
-    return std * z
-
-
-# -------- Safe download wrapper --------
 def safe_download(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    """
-    yfinance sometimes raises ValueError('No objects to concatenate') when nothing is returned.
-    This wrapper prevents the whole app from crashing.
-    """
     t = str(ticker).strip().upper()
     if not t:
         return pd.DataFrame()
-
     try:
         df = yf.download(t, period=period, interval=interval, group_by="column")
         if df is None or df.empty:
@@ -88,7 +40,83 @@ def safe_download(ticker: str, period: str, interval: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# -------- Data loading --------
+def safe_float(x, default=np.nan) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def prob_bucket(p: float) -> str:
+    if not np.isfinite(p):
+        return "Unknown"
+    if p >= 0.60:
+        return "Green"
+    if p >= 0.40:
+        return "Yellow"
+    return "Red"
+
+
+def bucket_emoji(bucket: str) -> str:
+    return {"Green": "🟢", "Yellow": "🟡", "Red": "🔴", "Unknown": "⚪"}.get(bucket, "⚪")
+
+
+def bucket_message(bucket: str) -> str:
+    if bucket == "Green":
+        return "More signs point UP than down (but it’s not guaranteed)."
+    if bucket == "Yellow":
+        return "Mixed signals. The model is not confident either way."
+    if bucket == "Red":
+        return "More signs point DOWN/flat than up (but it’s not guaranteed)."
+    return "Not enough info to decide."
+
+
+def pred_range_from_history(df_feat: pd.DataFrame, pred_col: str = "pred_return", z: float = 1.5):
+    if pred_col not in df_feat.columns:
+        return None
+    s = pd.to_numeric(df_feat[pred_col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if len(s) < 30:
+        return None
+    std = float(s.tail(120).std())
+    if not np.isfinite(std) or std <= 0:
+        return None
+    return std * z
+
+
+def get_pattern_label(preds, closes) -> str:
+    preds = np.array(preds, dtype=float)
+    closes = np.array(closes, dtype=float)
+    if len(preds) < 5 or len(closes) < 10:
+        return "Not enough data"
+    last5 = preds[-5:]
+    ones_ratio = last5.mean()
+    last_prices = closes[-10:]
+    x = np.arange(len(last_prices))
+    slope = np.polyfit(x, last_prices, 1)[0]
+    if ones_ratio > 0.6 and slope > 0:
+        return "Uptrend"
+    if ones_ratio < 0.4 and slope < 0:
+        return "Downtrend"
+    return "Sideways"
+
+
+def load_rf_model(mode: str):
+    path = DAILY_MODEL_PATH if mode == "daily" else HOURLY_MODEL_PATH
+    if not os.path.exists(path):
+        st.error(f"Model file not found: {path}")
+        return None
+    return joblib.load(path)
+
+
+def clean_features(df_feat: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    feat = df_feat[feature_cols].apply(pd.to_numeric, errors="coerce")
+    feat = feat.replace([np.inf, -np.inf], np.nan)
+    mask = feat.notna().all(axis=1)
+    return df_feat.loc[mask].copy(), feat.loc[mask].copy()
+
+
 @st.cache_data
 def load_tickers_csv() -> pd.DataFrame:
     if not TICKERS_CSV.exists():
@@ -112,115 +140,43 @@ def validate_ticker(sym: str, interval: str) -> bool:
 
 
 def ticker_picker_ui(tickers_df: pd.DataFrame) -> str:
-    st.subheader("Ticker search (CSV)")
-
+    st.markdown("### 1) Choose a stock")
     categories = ["All"] + sorted([c for c in tickers_df["category"].dropna().unique().tolist() if str(c).strip()])
-    category = st.selectbox("Filter category", categories, index=0)
+    category = st.selectbox("Filter (optional)", categories, index=0)
 
     df = tickers_df.copy()
     if category != "All":
         df = df[df["category"] == category]
 
-    query = st.text_input("Search symbol / company name", value="AAPL").strip().lower()
-
+    query = st.text_input("Search by ticker or company name", value="AAPL").strip().lower()
     if query:
         mask = (
             df["symbol"].str.lower().str.contains(query, na=False)
             | df["name"].str.lower().str.contains(query, na=False)
-            | df["exchange"].str.lower().str.contains(query, na=False)
         )
         df = df[mask].copy()
 
-    df = df.head(80)
+    df = df.head(60)
 
     if df.empty:
-        st.info("No matches. Add symbol to data/tickers.csv or use fallback input.")
-        return st.text_input("Fallback ticker", value="AAPL").strip().upper()
+        st.info("No match found. Try a different name or enter a ticker directly.")
+        return st.text_input("Enter ticker (example: AAPL)", value="AAPL").strip().upper()
 
-    df["label"] = df.apply(
-        lambda r: f"{r['symbol']} — {r['name']} ({r['exchange']})"
-        if str(r["exchange"]).strip()
-        else f"{r['symbol']} — {r['name']}",
-        axis=1,
-    )
-    choice = st.selectbox("Select ticker", df["label"].tolist(), index=0)
+    df["label"] = df.apply(lambda r: f"{r['symbol']} — {r['name']}", axis=1)
+    choice = st.selectbox("Pick one", df["label"].tolist(), index=0)
     return choice.split(" — ", 1)[0].strip().upper()
 
 
-def get_pattern_label(preds, closes) -> str:
-    preds = np.array(preds, dtype=float)
-    closes = np.array(closes, dtype=float)
-    if len(preds) < 5 or len(closes) < 10:
-        return "Not enough data"
-    last5 = preds[-5:]
-    ones_ratio = last5.mean()
-    last_prices = closes[-10:]
-    x = np.arange(len(last_prices))
-    slope = np.polyfit(x, last_prices, 1)[0]
-    if ones_ratio > 0.6 and slope > 0:
-        return "UPTREND / BULLISH"
-    if ones_ratio < 0.4 and slope < 0:
-        return "DOWNTREND / BEARISH"
-    return "SIDEWAYS / NEUTRAL"
-
-
-def load_rf_model(mode: str):
-    path = DAILY_MODEL_PATH if mode == "daily" else HOURLY_MODEL_PATH
-    if not os.path.exists(path):
-        st.error(f"RF model not found: {path}")
-        return None
-    return joblib.load(path)
-
-
-@st.cache_resource
-def load_dl_model_cached():
-    """
-    DL is optional. On Streamlit Cloud (Python 3.13), TF/Keras often can't load.
-    This function NEVER crashes the app.
-    """
-    if not (os.path.exists(DL_MODEL_DIR) and os.path.exists(DL_META_PATH)):
-        return None, None
-
-    if load_model is None:
-        return None, {"error": "TensorFlow/Keras not available in this environment."}
-
-    try:
-        model = load_model(DL_MODEL_DIR)
-        meta = joblib.load(DL_META_PATH)
-        return model, meta
-    except Exception as e:
-        return None, {"error": str(e)}
-
-
-def build_sequences_for_app(X_scaled: np.ndarray, window: int) -> np.ndarray:
-    seqs = []
-    for i in range(window, len(X_scaled)):
-        seqs.append(X_scaled[i - window : i])
-    if not seqs:
-        return np.empty((0, window, X_scaled.shape[1]))
-    return np.array(seqs)
-
-
-# -------- RF cleaning helpers (Fix NaN/Inf crash) --------
-def clean_features(df_feat: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    feat = df_feat[feature_cols].apply(pd.to_numeric, errors="coerce")
-    feat = feat.replace([np.inf, -np.inf], np.nan)
-    mask = feat.notna().all(axis=1)
-    df_clean = df_feat.loc[mask].copy()
-    feat_clean = feat.loc[mask].copy()
-    return df_clean, feat_clean
-
-
-def render_rf_result(df_feat: pd.DataFrame, rf_bundle: dict):
+# -------------------- UI renderers --------------------
+def render_layman_summary(df_feat: pd.DataFrame, rf_bundle: dict, timeframe_label: str):
     feature_cols = [c for c in rf_bundle["features"] if c in df_feat.columns]
     df_feat, feat = clean_features(df_feat, feature_cols)
 
     if df_feat.empty or feat.empty:
-        st.error("Not enough valid rows after cleaning NaN/Inf features.")
+        st.error("Not enough clean data to make a prediction right now.")
         st.stop()
 
     X = feat.values
-
     preds = rf_bundle["clf"].predict(X)
     probs = rf_bundle["clf"].predict_proba(X)[:, 1]
     rets = rf_bundle["reg"].predict(X)
@@ -230,61 +186,101 @@ def render_rf_result(df_feat: pd.DataFrame, rf_bundle: dict):
     df_feat["pred_return"] = rets
 
     latest = df_feat.iloc[-1]
-    p_up = safe_float(latest["prob_up"])
-    pred_ret = safe_float(latest["pred_return"])
-    close = safe_float(latest["Close"])
-    rsi = safe_float(latest["rsi_14"])
+    close = safe_float(latest.get("Close"))
+    p_up = safe_float(latest.get("prob_up"))
+    pred_ret = safe_float(latest.get("pred_return"))
+    rsi = safe_float(latest.get("rsi_14"))
 
-    pattern = get_pattern_label(df_feat["pred_up"].values, df_feat["Close"].values)
+    bucket = prob_bucket(p_up)
+    emoji = bucket_emoji(bucket)
 
-    # ---- Metrics with tooltips ----
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Last Close", f"${close:,.2f}", help="Most recent close price from Yahoo Finance")
-    c2.metric(
-        f"Prob UP (RF) {prob_badge(p_up)}",
-        f"{p_up:.1%}",
-        help="Model probability that the next period return is positive",
+    # Big headline card
+    st.markdown("### 3) Result (easy view)")
+    st.markdown(
+        f"""
+<div style="padding:18px;border-radius:16px;border:1px solid #2a2a2a;">
+  <div style="font-size:28px;font-weight:700;">{emoji} {bucket} Signal</div>
+  <div style="font-size:16px;opacity:0.9;margin-top:6px;">{bucket_message(bucket)}</div>
+  <div style="margin-top:10px;font-size:14px;opacity:0.85;">
+    Timeframe: <b>{timeframe_label}</b> — This is a short-term statistical guess, not financial advice.
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
     )
-    c3.metric("RSI(14)", f"{rsi:.1f}", help="Relative Strength Index: >70 overbought, <30 oversold")
-    c4.metric("Pred Move (RF)", f"{pred_ret*100:+.2f}%", help="Predicted next-period return (regression)")
 
-    st.write(f"**Pattern:** {pattern}")
+    # Simple metrics
+    st.markdown("#### Key numbers (what most people care about)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Current price", f"${close:,.2f}")
+    c2.metric("Chance of going up", f"{p_up:.0%}")
+    c3.metric("Estimated move", f"{pred_ret*100:+.2f}%")
 
-    # ---- Confidence band ----
+    st.caption(
+        "“Chance of going up” is the model’s confidence, not a guarantee. "
+        "“Estimated move” is an average guess of how much it might move next period."
+    )
+
+    # Range
     band = pred_range_from_history(df_feat, pred_col="pred_return", z=1.5)
     if band is not None:
         low = (pred_ret - band) * 100
         high = (pred_ret + band) * 100
-        st.info(f"📌 Expected move range (approx): **{low:+.2f}% → {high:+.2f}%**")
+        st.info(f"Expected move range (rough): **{low:+.2f}% → {high:+.2f}%**")
     else:
-        st.caption("Move range: not enough history to estimate uncertainty band.")
+        st.caption("Move range: not enough history to estimate uncertainty.")
 
-    # ---- Price chart ----
+    # Trend + RSI explanation
+    st.markdown("#### Extra context (still simple)")
+    trend = get_pattern_label(df_feat["pred_up"].values, df_feat["Close"].values)
+    c4, c5 = st.columns(2)
+    c4.metric("Recent trend", trend)
+    c5.metric("RSI (momentum)", f"{rsi:.1f}")
+
+    st.caption(
+        "RSI is a momentum indicator. Rough rule: above ~70 can mean “overheated”, below ~30 can mean “oversold”. "
+        "It’s only one signal."
+    )
+
+    # Chart
+    st.markdown("#### Price chart (last part is most important)")
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(df_feat.index, df_feat["Close"], label="Close")
     if "ma_5" in df_feat.columns:
-        ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
+        ax.plot(df_feat.index, df_feat["ma_5"], label="Avg (5)")
     if "ma_10" in df_feat.columns:
-        ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
+        ax.plot(df_feat.index, df_feat["ma_10"], label="Avg (10)")
     if "ma_20" in df_feat.columns:
-        ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
+        ax.plot(df_feat.index, df_feat["ma_20"], label="Avg (20)")
     ax.legend()
     st.pyplot(fig)
 
-    st.dataframe(df_feat[["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]].tail(25))
+    # Advanced (collapsible)
+    with st.expander("Advanced details (for learning / debugging)", expanded=False):
+        st.write("Recent rows with model outputs:")
+        st.dataframe(df_feat[["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]].tail(25))
 
-    # ---- Explainability ----
-    st.subheader("🔎 Why the model predicts this (Top Drivers)")
-    try:
-        importances = rf_bundle["clf"].feature_importances_
-        imp_df = pd.DataFrame(
-            {"Feature": rf_bundle["features"], "Importance": importances}
-        ).sort_values("Importance", ascending=False).head(12)
+        st.write("Top factors the model generally uses (feature importance):")
+        try:
+            importances = rf_bundle["clf"].feature_importances_
+            imp_df = pd.DataFrame(
+                {"Feature": rf_bundle["features"], "Importance": importances}
+            ).sort_values("Importance", ascending=False).head(12)
+            st.bar_chart(imp_df.set_index("Feature"))
+            st.caption("These are global importances (overall), not a per-day explanation.")
+        except Exception as e:
+            st.caption(f"Could not show importances: {str(e)[:200]}")
 
-        st.bar_chart(imp_df.set_index("Feature"))
-        st.caption("Global feature importances from the RandomForest model (not per-row SHAP).")
-    except Exception as e:
-        st.caption(f"Could not display feature importances: {str(e)[:200]}")
+    # Glossary
+    with st.expander("Glossary (plain English)", expanded=False):
+        st.markdown(
+            """
+- **Chance of going up**: the model’s confidence that the price will be higher next period.
+- **Estimated move**: the model’s guess of the % change next period (example: +0.80%).
+- **RSI**: a momentum score (0–100). Above ~70 can mean “overbought”, below ~30 can mean “oversold”.
+- **Moving average (Avg 5/10/20)**: average price over last 5/10/20 periods, used to smooth noise.
+"""
+        )
 
 
 def run_rf_for_ticker(ticker: str, period: str, interval: str, rf_bundle: dict) -> dict:
@@ -298,25 +294,27 @@ def run_rf_for_ticker(ticker: str, period: str, interval: str, rf_bundle: dict) 
     feature_cols = [c for c in rf_bundle["features"] if c in df_feat.columns]
     df_feat, feat = clean_features(df_feat, feature_cols)
     if df_feat.empty or feat.empty:
-        return {"ticker": ticker, "error": "Not enough valid rows after cleaning NaN/Inf features"}
+        return {"ticker": ticker, "error": "Not enough clean rows"}
 
     X = feat.values
-    preds = rf_bundle["clf"].predict(X)
     probs = rf_bundle["clf"].predict_proba(X)[:, 1]
     rets = rf_bundle["reg"].predict(X)
 
-    df_feat["pred_up"] = preds
-    df_feat["prob_up"] = probs
-    df_feat["pred_return"] = rets
-
     latest = df_feat.iloc[-1]
+    p_up = float(probs[-1])
+    pred_ret = float(rets[-1])
+    close = safe_float(latest.get("Close"))
+    rsi = safe_float(latest.get("rsi_14"))
+
+    bucket = prob_bucket(p_up)
     return {
         "ticker": ticker,
-        "close": safe_float(latest.get("Close")),
-        "rsi": safe_float(latest.get("rsi_14")),
-        "prob_up": safe_float(latest.get("prob_up")),
-        "pred_return": safe_float(latest.get("pred_return")),
-        "pattern": get_pattern_label(df_feat["pred_up"].values, df_feat["Close"].values),
+        "close": close,
+        "chance_up": p_up,
+        "confidence": f"{bucket_emoji(bucket)} {bucket}",
+        "move_pct": pred_ret * 100,
+        "rsi": rsi,
+        "note": bucket_message(bucket),
     }
 
 
@@ -324,254 +322,195 @@ def load_portfolio() -> pd.DataFrame:
     if not PORTFOLIO_CSV.exists():
         return pd.DataFrame(columns=["symbol", "shares", "avg_cost"])
     df = pd.read_csv(PORTFOLIO_CSV)
-
     for c in ["symbol", "shares", "avg_cost"]:
         if c not in df.columns:
             df[c] = np.nan
-
     df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
     df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
     df["avg_cost"] = pd.to_numeric(df["avg_cost"], errors="coerce")
-
     df = df.dropna(subset=["symbol", "shares", "avg_cost"])
     df = df[df["symbol"] != ""]
     return df
 
 
-# -------- Streamlit App --------
+# -------------------- main app --------------------
 def main():
-    st.set_page_config(page_title="Stock Pattern Detector", page_icon="📈", layout="wide")
-    st.title("📈 Stock Pattern Detector — RF + Optional DL (Cloud-safe)")
+    st.set_page_config(page_title="Stock Trend Helper", page_icon="📈", layout="wide")
+
+    st.title("📈 Stock Trend Helper (Easy View)")
+    st.caption(
+        "This app shows a short-term **signal** (Green/Yellow/Red) based on recent price patterns. "
+        "It’s a learning tool — not financial advice."
+    )
 
     tickers_df = load_tickers_csv()
-    if tickers_df.empty:
-        st.warning("data/tickers.csv missing or empty. Run: python scripts/update_tickers.py")
 
-    st.sidebar.header("Mode")
+    st.sidebar.header("Settings")
     timeframe = st.sidebar.radio("Timeframe", ["Daily (next day)", "Hourly (next hour)"], index=0)
     mode = "daily" if timeframe.startswith("Daily") else "hourly"
     interval = "1d" if mode == "daily" else "60m"
-    period = st.sidebar.selectbox("History period", ["6mo", "1y", "2y", "5y", "10y"], index=2) if mode == "daily" else "60d"
+    period = st.sidebar.selectbox("How much history to use", ["6mo", "1y", "2y", "5y", "10y"], index=2) if mode == "daily" else "60d"
 
-    st.sidebar.header("Model")
-    model_choices = ["RandomForest (ML)"]
-    if not is_streamlit_cloud():
-        model_choices.append("LSTM (DL - daily only)")
-    model_type = st.sidebar.radio("Choose model", model_choices, index=0)
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Tip:** Green does not mean “buy”. It means “more signs point up”. Always manage risk.")
 
-    tab_predict, tab_compare, tab_portfolio, tab_admin = st.tabs(
-        ["🔮 Single Ticker", "🧾 Compare Tickers", "💼 Portfolio Dashboard", "⚙️ Admin/Info"]
+    tab_predict, tab_compare, tab_portfolio, tab_help = st.tabs(
+        ["🔮 Simple Prediction", "🧾 Compare", "💼 Portfolio", "❓ Help"]
     )
 
-    # ---------------- Single ticker ----------------
+    # ---------- Prediction ----------
     with tab_predict:
-        ticker = ticker_picker_ui(tickers_df) if not tickers_df.empty else st.text_input("Ticker", "AAPL").strip().upper()
+        if tickers_df.empty:
+            ticker = st.text_input("Enter ticker (example: AAPL)", value="AAPL").strip().upper()
+        else:
+            ticker = ticker_picker_ui(tickers_df)
 
-        if not validate_ticker(ticker, interval=interval):
-            st.error(f"Ticker '{ticker}' invalid/no data for interval {interval}.")
-            st.stop()
-
-        run = st.button("Run analysis", type="primary")
+        st.markdown("### 2) Run")
+        run = st.button("Run Prediction", type="primary")
 
         if run:
-            with st.spinner("Downloading + computing predictions..."):
+            if not validate_ticker(ticker, interval=interval):
+                st.error(f"Ticker '{ticker}' not found or no data available for {interval}. Try another.")
+                st.stop()
+
+            rf = load_rf_model(mode)
+            if rf is None:
+                st.stop()
+
+            with st.spinner("Loading data and generating signal..."):
                 df = safe_download(ticker, period=period, interval=interval)
                 if df is None or df.empty:
-                    st.error("No data returned.")
+                    st.error("No data returned for this ticker.")
                     st.stop()
 
                 df_feat = engineer_features(df, include_targets=False)
                 df_feat = add_market_context(df_feat, period=period, interval=interval)
 
-                if model_type.startswith("RandomForest"):
-                    rf = load_rf_model(mode)
-                    if rf is None:
-                        st.stop()
-                    render_rf_result(df_feat, rf)
-                else:
-                    dl_model, meta = load_dl_model_cached()
-                    if dl_model is None:
-                        msg = "DL model unavailable here. Falling back to RandomForest."
-                        if isinstance(meta, dict) and meta.get("error"):
-                            msg += f"\n\nReason: {meta['error'][:250]}"
-                        st.warning(msg)
+            render_layman_summary(df_feat, rf, timeframe_label=timeframe)
 
-                        rf = load_rf_model(mode)
-                        if rf is None:
-                            st.stop()
-                        render_rf_result(df_feat, rf)
-                    else:
-                        # DL inference (local only; still supported)
-                        feature_cols = [c for c in meta["feature_cols"] if c in df_feat.columns]
-                        df_feat = df_feat.dropna(subset=feature_cols).copy()
-                        if df_feat.empty:
-                            st.error("Not enough data after feature engineering.")
-                            st.stop()
-
-                        scaler = meta["scaler"]
-                        window = int(meta["window"])
-
-                        X_raw = df_feat[feature_cols].values
-                        X_scaled = scaler.transform(X_raw)
-                        X_seq = build_sequences_for_app(X_scaled, window=window)
-                        if X_seq.shape[0] == 0:
-                            st.error(f"Not enough rows for DL window={window}.")
-                            st.stop()
-
-                        dir_probs, mag_preds = dl_model.predict(X_seq)
-                        dir_probs = dir_probs.ravel()
-                        mag_preds = mag_preds.ravel()
-                        dir_preds = (dir_probs >= 0.5).astype(int)
-
-                        df_pred = df_feat.copy()
-                        df_pred["dl_pred_up"] = np.nan
-                        df_pred["dl_prob_up"] = np.nan
-                        df_pred["dl_pred_return"] = np.nan
-                        df_pred.iloc[window:, df_pred.columns.get_loc("dl_pred_up")] = dir_preds
-                        df_pred.iloc[window:, df_pred.columns.get_loc("dl_prob_up")] = dir_probs
-                        df_pred.iloc[window:, df_pred.columns.get_loc("dl_pred_return")] = mag_preds
-
-                        valid = df_pred["dl_prob_up"].notna() & df_pred["dl_pred_return"].notna()
-                        df_valid = df_pred[valid]
-                        latest = df_valid.iloc[-1]
-                        pattern = get_pattern_label(df_valid["dl_pred_up"].values, df_valid["Close"].values)
-
-                        p_up = safe_float(latest["dl_prob_up"])
-                        pred_ret = safe_float(latest["dl_pred_return"])
-                        close = safe_float(latest["Close"])
-                        rsi = safe_float(latest["rsi_14"])
-
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("Last Close", f"${close:,.2f}", help="Most recent close price from Yahoo Finance")
-                        c2.metric(
-                            f"Prob UP (DL) {prob_badge(p_up)}",
-                            f"{p_up:.1%}",
-                            help="DL model probability that next period return is positive",
-                        )
-                        c3.metric("RSI(14)", f"{rsi:.1f}", help="Relative Strength Index: >70 overbought, <30 oversold")
-                        c4.metric("Pred Move (DL)", f"{pred_ret*100:+.2f}%", help="Predicted next-period return (DL magnitude head)")
-                        st.write(f"**Pattern:** {pattern}")
-
-                        fig, ax = plt.subplots(figsize=(10, 4))
-                        ax.plot(df_feat.index, df_feat["Close"], label="Close")
-                        if "ma_5" in df_feat.columns:
-                            ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
-                        if "ma_10" in df_feat.columns:
-                            ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
-                        if "ma_20" in df_feat.columns:
-                            ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
-                        ax.legend()
-                        st.pyplot(fig)
-
-                        st.dataframe(df_valid[["Close", "rsi_14", "dl_pred_up", "dl_prob_up", "dl_pred_return"]].tail(25))
-
-    # ---------------- Compare tickers (RF only) ----------------
+    # ---------- Compare ----------
     with tab_compare:
-        st.subheader("Compare multiple tickers (scanner) — RF only")
+        st.markdown("### Compare a few stocks (fast scan)")
         rf = load_rf_model(mode)
         if rf is None:
-            st.info("Train and commit the RF model first.")
+            st.info("Train and commit the model first.")
         else:
             symbols = tickers_df["symbol"].tolist() if not tickers_df.empty else ["AAPL", "MSFT", "NVDA", "SPY", "QQQ"]
             default = [s for s in ["AAPL", "MSFT", "NVDA"] if s in symbols] or symbols[:3]
             picks = st.multiselect("Pick tickers", symbols, default=default)
 
-            if st.button("Run scan"):
+            if st.button("Run Scan"):
                 rows = []
-                with st.spinner("Scanning tickers..."):
+                with st.spinner("Scanning..."):
                     for sym in picks:
                         rows.append(run_rf_for_ticker(sym, period, interval, rf))
 
                 df_out = pd.DataFrame([{
                     "Ticker": r.get("ticker"),
-                    "Close": r.get("close"),
-                    "Prob_UP": r.get("prob_up"),
-                    "Confidence": (prob_badge(r.get("prob_up")) if r.get("prob_up") is not None and np.isfinite(r.get("prob_up")) else ""),
-                    "Pred_Move_%": None if r.get("pred_return") is None or not np.isfinite(r.get("pred_return")) else r.get("pred_return") * 100,
+                    "Price": r.get("close"),
+                    "Chance Up": (None if r.get("chance_up") is None else float(r.get("chance_up"))),
+                    "Signal": r.get("confidence"),
+                    "Est. Move %": r.get("move_pct"),
                     "RSI": r.get("rsi"),
-                    "Pattern": r.get("pattern"),
+                    "Plain-English note": r.get("note", ""),
                     "Error": r.get("error", "")
                 } for r in rows])
 
-                # Sort best first; errors bottom
-                df_out = df_out.sort_values(by=["Error", "Prob_UP"], ascending=[True, False], na_position="last")
+                df_out["Chance Up"] = pd.to_numeric(df_out["Chance Up"], errors="coerce")
+                df_out = df_out.sort_values(by=["Error", "Chance Up"], ascending=[True, False], na_position="last")
                 st.dataframe(df_out, use_container_width=True)
 
-    # ---------------- Portfolio dashboard (SAFE) ----------------
+    # ---------- Portfolio ----------
     with tab_portfolio:
-        st.subheader("Portfolio dashboard (from data/portfolio.csv)")
-        port = load_portfolio()
+        st.markdown("### Portfolio (simple overview)")
+        st.caption("Add your holdings in `data/portfolio.csv` with columns: symbol, shares, avg_cost")
 
+        port = load_portfolio()
         if port.empty:
-            st.warning("Create data/portfolio.csv with columns: symbol, shares, avg_cost")
+            st.warning("No portfolio file found or it is empty.")
         else:
-            rf_daily = load_rf_model("daily")  # portfolio signals use daily RF
+            rf_daily = load_rf_model("daily")
             rows = []
 
-            with st.spinner("Computing portfolio + signals..."):
+            with st.spinner("Calculating portfolio..."):
                 for _, r in port.iterrows():
                     sym = str(r["symbol"]).strip().upper()
                     shares = float(r["shares"])
                     avg_cost = float(r["avg_cost"])
 
                     dfp = safe_download(sym, period="6mo", interval="1d")
-                    if dfp is None or dfp.empty:
-                        rows.append({
-                            "Symbol": sym,
-                            "Shares": shares,
-                            "Avg Cost": avg_cost,
-                            "Error": "No data / invalid symbol"
-                        })
+                    if dfp.empty:
+                        rows.append({"Symbol": sym, "Error": "No data"})
                         continue
 
-                    last_close = float(dfp["Close"].iloc[-1])
-                    mv = shares * last_close
+                    price = float(dfp["Close"].iloc[-1])
+                    mv = shares * price
                     cost = shares * avg_cost
                     pnl = mv - cost
-                    pnl_pct = (pnl / cost) * 100 if cost != 0 else np.nan
+                    pnl_pct = (pnl / cost) * 100 if cost else np.nan
 
-                    prob_up = np.nan
-                    pred_move_pct = np.nan
-                    pattern = ""
+                    signal = ""
+                    chance = np.nan
+                    move = np.nan
+                    note = ""
 
                     if rf_daily is not None:
                         res = run_rf_for_ticker(sym, "2y", "1d", rf_daily)
                         if "error" not in res:
-                            prob_up = res["prob_up"]
-                            pred_move_pct = res["pred_return"] * 100
-                            pattern = res["pattern"]
+                            signal = res["confidence"]
+                            chance = res["chance_up"]
+                            move = res["move_pct"]
+                            note = res["note"]
 
                     rows.append({
                         "Symbol": sym,
                         "Shares": shares,
                         "Avg Cost": avg_cost,
-                        "Last Close": last_close,
+                        "Price": price,
                         "Market Value": mv,
-                        "Cost Basis": cost,
-                        "P&L": pnl,
+                        "P&L $": pnl,
                         "P&L %": pnl_pct,
-                        "Prob UP": prob_up,
-                        "Confidence": (prob_badge(prob_up) if np.isfinite(prob_up) else ""),
-                        "Pred Move %": pred_move_pct,
-                        "Pattern": pattern,
-                        "Error": ""
+                        "Signal": signal,
+                        "Chance Up": chance,
+                        "Est. Move %": move,
+                        "Note": note
                     })
 
-            df_port = pd.DataFrame(rows)
-            st.dataframe(df_port, use_container_width=True)
+            dfp = pd.DataFrame(rows)
+            st.dataframe(dfp, use_container_width=True)
 
-    # ---------------- Admin / Info ----------------
-    with tab_admin:
-        st.subheader("Quick commands")
-        st.code(
-            "\n".join([
-                "python scripts/update_tickers.py",
-                "python train_model.py --ticker AAPL --period 10y --interval 1d --out models/saved_model.pkl",
-                "python train_model.py --ticker AAPL --period 60d --interval 60m --out models/saved_model_hourly.pkl",
-                "python train_model_dl.py",
-            ])
+    # ---------- Help ----------
+    with tab_help:
+        st.markdown("## How to read this app (for beginners)")
+        st.markdown(
+            """
+**Green / Yellow / Red Signal** is a simple summary:
+
+- 🟢 **Green**: more signs point UP than down.
+- 🟡 **Yellow**: mixed signals (model not confident).
+- 🔴 **Red**: more signs point DOWN/flat than up.
+
+**Important:** this is not a guarantee and not financial advice.
+
+### What is “Chance Up”?
+It’s how confident the model is that the price will be higher next period.
+
+### What is “Estimated move”?
+A rough guess of the % change next period (example: +0.80%).
+
+### Why can it be wrong?
+News, earnings, macro events, and sudden volatility can move prices in ways the model can’t predict.
+"""
         )
-        st.write("**Note:** Streamlit Cloud runs Python 3.13. DL loading may fail there; RF is recommended on Cloud.")
+
+        st.markdown("## Simple tips")
+        st.markdown(
+            """
+- Don’t use this alone for decisions.
+- Use it as one input along with news + fundamentals + risk management.
+- If you want reliability, focus on ETFs (SPY/QQQ) rather than single small stocks.
+"""
+        )
 
 
 if __name__ == "__main__":
