@@ -1,0 +1,17 @@
+symbol,name,exchange
+AAPL,Apple Inc,NASDAQ
+MSFT,Microsoft Corporation,NASDAQ
+NVDA,NVIDIA Corporation,NASDAQ
+AMZN,Amazon.com Inc,NASDAQ
+GOOGL,Alphabet Inc Class A,NASDAQ
+META,Meta Platforms Inc,NASDAQ
+TSLA,Tesla Inc,NASDAQ
+AMD,Advanced Micro Devices Inc,NASDAQ
+NFLX,Netflix Inc,NASDAQ
+SPY,SPDR S&P 500 ETF Trust,NYSEARCA
+QQQ,Invesco QQQ Trust,NASDAQ
+IWM,iShares Russell 2000 ETF,NYSEARCA
+VOO,Vanguard S&P 500 ETF,NYSEARCA
+VTI,Vanguard Total Stock Market ETF,NYSEARCA
+BTC-USD,Bitcoin USD,Crypto
+ETH-USD,Ethereum USD,Crypto
