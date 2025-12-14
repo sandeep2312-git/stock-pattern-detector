@@ -13,17 +13,12 @@ from feature_engineering import engineer_features, add_market_context
 # -------- Paths --------
 DAILY_MODEL_PATH = "models/saved_model.pkl"
 HOURLY_MODEL_PATH = "models/saved_model_hourly.pkl"
-
 TICKERS_CSV = Path("data") / "tickers.csv"
-PORTFOLIO_CSV = Path("data") / "portfolio.csv"
 
 
 # -------------------- helpers --------------------
-def is_streamlit_cloud() -> bool:
-    return os.path.exists("/mount/src")
-
-
 def safe_download(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    """Download with strong safety: never crash app on yfinance weirdness."""
     t = str(ticker).strip().upper()
     if not t:
         return pd.DataFrame()
@@ -33,6 +28,7 @@ def safe_download(ticker: str, period: str, interval: str) -> pd.DataFrame:
             return pd.DataFrame()
         return df
     except ValueError as e:
+        # yfinance sometimes throws this if symbol invalid / no rows
         if "No objects to concatenate" in str(e):
             return pd.DataFrame()
         raise
@@ -65,15 +61,16 @@ def bucket_emoji(bucket: str) -> str:
 
 def bucket_message(bucket: str) -> str:
     if bucket == "Green":
-        return "More signs point UP than down (but it’s not guaranteed)."
+        return "More signs point UP than down (not guaranteed)."
     if bucket == "Yellow":
-        return "Mixed signals. The model is not confident either way."
+        return "Mixed signals. The model is not confident."
     if bucket == "Red":
-        return "More signs point DOWN/flat than up (but it’s not guaranteed)."
+        return "More signs point DOWN/flat than up (not guaranteed)."
     return "Not enough info to decide."
 
 
 def pred_range_from_history(df_feat: pd.DataFrame, pred_col: str = "pred_return", z: float = 1.5):
+    """Rough move-range band from prediction dispersion."""
     if pred_col not in df_feat.columns:
         return None
     s = pd.to_numeric(df_feat[pred_col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
@@ -111,6 +108,9 @@ def load_rf_model(mode: str):
 
 
 def clean_features(df_feat: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Remove NaN/Inf rows so sklearn won't crash."""
+    if not feature_cols:
+        return df_feat.iloc[0:0].copy(), df_feat.iloc[0:0].copy()
     feat = df_feat[feature_cols].apply(pd.to_numeric, errors="coerce")
     feat = feat.replace([np.inf, -np.inf], np.nan)
     mask = feat.notna().all(axis=1)
@@ -194,7 +194,7 @@ def render_layman_summary(df_feat: pd.DataFrame, rf_bundle: dict, timeframe_labe
     bucket = prob_bucket(p_up)
     emoji = bucket_emoji(bucket)
 
-    # Big headline card
+    # Big summary card
     st.markdown("### 3) Result (easy view)")
     st.markdown(
         f"""
@@ -210,15 +210,15 @@ def render_layman_summary(df_feat: pd.DataFrame, rf_bundle: dict, timeframe_labe
     )
 
     # Simple metrics
-    st.markdown("#### Key numbers (what most people care about)")
+    st.markdown("#### Key numbers (plain English)")
     c1, c2, c3 = st.columns(3)
     c1.metric("Current price", f"${close:,.2f}")
     c2.metric("Chance of going up", f"{p_up:.0%}")
     c3.metric("Estimated move", f"{pred_ret*100:+.2f}%")
 
     st.caption(
-        "“Chance of going up” is the model’s confidence, not a guarantee. "
-        "“Estimated move” is an average guess of how much it might move next period."
+        "“Chance of going up” is the model’s confidence (not a guarantee). "
+        "“Estimated move” is a rough guess of the next period % change."
     )
 
     # Range
@@ -236,14 +236,12 @@ def render_layman_summary(df_feat: pd.DataFrame, rf_bundle: dict, timeframe_labe
     c4, c5 = st.columns(2)
     c4.metric("Recent trend", trend)
     c5.metric("RSI (momentum)", f"{rsi:.1f}")
-
     st.caption(
-        "RSI is a momentum indicator. Rough rule: above ~70 can mean “overheated”, below ~30 can mean “oversold”. "
-        "It’s only one signal."
+        "RSI is a momentum score. Rough rule: above ~70 can mean “overheated”, below ~30 can mean “oversold”."
     )
 
     # Chart
-    st.markdown("#### Price chart (last part is most important)")
+    st.markdown("#### Price chart")
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(df_feat.index, df_feat["Close"], label="Close")
     if "ma_5" in df_feat.columns:
@@ -255,30 +253,31 @@ def render_layman_summary(df_feat: pd.DataFrame, rf_bundle: dict, timeframe_labe
     ax.legend()
     st.pyplot(fig)
 
-    # Advanced (collapsible)
-    with st.expander("Advanced details (for learning / debugging)", expanded=False):
+    # Advanced (collapsed)
+    with st.expander("Advanced details (optional)", expanded=False):
         st.write("Recent rows with model outputs:")
         st.dataframe(df_feat[["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]].tail(25))
 
         st.write("Top factors the model generally uses (feature importance):")
         try:
             importances = rf_bundle["clf"].feature_importances_
-            imp_df = pd.DataFrame(
-                {"Feature": rf_bundle["features"], "Importance": importances}
-            ).sort_values("Importance", ascending=False).head(12)
+            imp_df = (
+                pd.DataFrame({"Feature": rf_bundle["features"], "Importance": importances})
+                .sort_values("Importance", ascending=False)
+                .head(12)
+            )
             st.bar_chart(imp_df.set_index("Feature"))
-            st.caption("These are global importances (overall), not a per-day explanation.")
+            st.caption("These are global importances (overall), not per-day explanations.")
         except Exception as e:
             st.caption(f"Could not show importances: {str(e)[:200]}")
 
-    # Glossary
     with st.expander("Glossary (plain English)", expanded=False):
         st.markdown(
             """
-- **Chance of going up**: the model’s confidence that the price will be higher next period.
-- **Estimated move**: the model’s guess of the % change next period (example: +0.80%).
-- **RSI**: a momentum score (0–100). Above ~70 can mean “overbought”, below ~30 can mean “oversold”.
-- **Moving average (Avg 5/10/20)**: average price over last 5/10/20 periods, used to smooth noise.
+- **Chance of going up**: how confident the model is the price will rise next period.
+- **Estimated move**: the model’s guess of the next period % change.
+- **RSI**: momentum score (0–100). Above ~70 can mean “overbought”, below ~30 can mean “oversold”.
+- **Moving averages**: smoothed price lines to reduce noise.
 """
         )
 
@@ -309,28 +308,14 @@ def run_rf_for_ticker(ticker: str, period: str, interval: str, rf_bundle: dict) 
     bucket = prob_bucket(p_up)
     return {
         "ticker": ticker,
-        "close": close,
+        "price": close,
         "chance_up": p_up,
-        "confidence": f"{bucket_emoji(bucket)} {bucket}",
+        "signal": f"{bucket_emoji(bucket)} {bucket}",
         "move_pct": pred_ret * 100,
         "rsi": rsi,
         "note": bucket_message(bucket),
+        "error": "",
     }
-
-
-def load_portfolio() -> pd.DataFrame:
-    if not PORTFOLIO_CSV.exists():
-        return pd.DataFrame(columns=["symbol", "shares", "avg_cost"])
-    df = pd.read_csv(PORTFOLIO_CSV)
-    for c in ["symbol", "shares", "avg_cost"]:
-        if c not in df.columns:
-            df[c] = np.nan
-    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
-    df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
-    df["avg_cost"] = pd.to_numeric(df["avg_cost"], errors="coerce")
-    df = df.dropna(subset=["symbol", "shares", "avg_cost"])
-    df = df[df["symbol"] != ""]
-    return df
 
 
 # -------------------- main app --------------------
@@ -352,15 +337,16 @@ def main():
     period = st.sidebar.selectbox("How much history to use", ["6mo", "1y", "2y", "5y", "10y"], index=2) if mode == "daily" else "60d"
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**Tip:** Green does not mean “buy”. It means “more signs point up”. Always manage risk.")
+    st.sidebar.markdown("**Tip:** Green ≠ buy. It only means “more signs point up”. Always manage risk.")
 
-    tab_predict, tab_compare, tab_portfolio, tab_help = st.tabs(
-        ["🔮 Simple Prediction", "🧾 Compare", "💼 Portfolio", "❓ Help"]
+    tab_predict, tab_compare, tab_tickers, tab_help = st.tabs(
+        ["🔮 Simple Prediction", "🧾 Compare", "📚 Available Tickers", "❓ Help"]
     )
 
     # ---------- Prediction ----------
     with tab_predict:
         if tickers_df.empty:
+            st.warning("No ticker list found. Add tickers to data/tickers.csv (columns: symbol,name,exchange,category).")
             ticker = st.text_input("Enter ticker (example: AAPL)", value="AAPL").strip().upper()
         else:
             ticker = ticker_picker_ui(tickers_df)
@@ -407,9 +393,9 @@ def main():
 
                 df_out = pd.DataFrame([{
                     "Ticker": r.get("ticker"),
-                    "Price": r.get("close"),
+                    "Price": r.get("price"),
                     "Chance Up": (None if r.get("chance_up") is None else float(r.get("chance_up"))),
-                    "Signal": r.get("confidence"),
+                    "Signal": r.get("signal"),
                     "Est. Move %": r.get("move_pct"),
                     "RSI": r.get("rsi"),
                     "Plain-English note": r.get("note", ""),
@@ -420,68 +406,52 @@ def main():
                 df_out = df_out.sort_values(by=["Error", "Chance Up"], ascending=[True, False], na_position="last")
                 st.dataframe(df_out, use_container_width=True)
 
-    # ---------- Portfolio ----------
-    with tab_portfolio:
-        st.markdown("### Portfolio (simple overview)")
-        st.caption("Add your holdings in `data/portfolio.csv` with columns: symbol, shares, avg_cost")
+    # ---------- Available Tickers ----------
+    with tab_tickers:
+        st.markdown("## 📚 Available Tickers")
+        st.caption(
+            "This list comes from your `data/tickers.csv`. "
+            "You can search and filter, then copy a symbol into the Prediction tab."
+        )
 
-        port = load_portfolio()
-        if port.empty:
-            st.warning("No portfolio file found or it is empty.")
-        else:
-            rf_daily = load_rf_model("daily")
-            rows = []
+        if tickers_df.empty:
+            st.warning("No ticker list found. Create data/tickers.csv with columns: symbol,name,exchange,category")
+            st.stop()
 
-            with st.spinner("Calculating portfolio..."):
-                for _, r in port.iterrows():
-                    sym = str(r["symbol"]).strip().upper()
-                    shares = float(r["shares"])
-                    avg_cost = float(r["avg_cost"])
+        c1, c2 = st.columns(2)
+        with c1:
+            category = st.selectbox(
+                "Filter by category",
+                ["All"] + sorted([x for x in tickers_df["category"].dropna().unique().tolist() if str(x).strip()]),
+            )
+        with c2:
+            exchange = st.selectbox(
+                "Filter by exchange",
+                ["All"] + sorted([x for x in tickers_df["exchange"].dropna().unique().tolist() if str(x).strip()]),
+            )
 
-                    dfp = safe_download(sym, period="6mo", interval="1d")
-                    if dfp.empty:
-                        rows.append({"Symbol": sym, "Error": "No data"})
-                        continue
+        df = tickers_df.copy()
+        if category != "All":
+            df = df[df["category"] == category]
+        if exchange != "All":
+            df = df[df["exchange"] == exchange]
 
-                    price = float(dfp["Close"].iloc[-1])
-                    mv = shares * price
-                    cost = shares * avg_cost
-                    pnl = mv - cost
-                    pnl_pct = (pnl / cost) * 100 if cost else np.nan
+        search = st.text_input("Search by ticker or company name", value="")
+        if search:
+            s = search.lower()
+            df = df[
+                df["symbol"].str.lower().str.contains(s, na=False)
+                | df["name"].str.lower().str.contains(s, na=False)
+            ]
 
-                    signal = ""
-                    chance = np.nan
-                    move = np.nan
-                    note = ""
+        st.markdown(f"### Showing {len(df)} tickers")
+        st.dataframe(df[["symbol", "name", "exchange", "category"]], use_container_width=True)
 
-                    if rf_daily is not None:
-                        res = run_rf_for_ticker(sym, "2y", "1d", rf_daily)
-                        if "error" not in res:
-                            signal = res["confidence"]
-                            chance = res["chance_up"]
-                            move = res["move_pct"]
-                            note = res["note"]
-
-                    rows.append({
-                        "Symbol": sym,
-                        "Shares": shares,
-                        "Avg Cost": avg_cost,
-                        "Price": price,
-                        "Market Value": mv,
-                        "P&L $": pnl,
-                        "P&L %": pnl_pct,
-                        "Signal": signal,
-                        "Chance Up": chance,
-                        "Est. Move %": move,
-                        "Note": note
-                    })
-
-            dfp = pd.DataFrame(rows)
-            st.dataframe(dfp, use_container_width=True)
+        st.info("Tip: Copy a ticker symbol from this table and paste it into **Simple Prediction** to analyze it.")
 
     # ---------- Help ----------
     with tab_help:
-        st.markdown("## How to read this app (for beginners)")
+        st.markdown("## How to read this app (beginners)")
         st.markdown(
             """
 **Green / Yellow / Red Signal** is a simple summary:
@@ -493,22 +463,22 @@ def main():
 **Important:** this is not a guarantee and not financial advice.
 
 ### What is “Chance Up”?
-It’s how confident the model is that the price will be higher next period.
+How confident the model is that the price will be higher next period.
 
 ### What is “Estimated move”?
-A rough guess of the % change next period (example: +0.80%).
+A rough guess of the next period % change (example: +0.80%).
 
 ### Why can it be wrong?
 News, earnings, macro events, and sudden volatility can move prices in ways the model can’t predict.
 """
         )
 
-        st.markdown("## Simple tips")
+        st.markdown("## Repo setup")
         st.markdown(
             """
-- Don’t use this alone for decisions.
-- Use it as one input along with news + fundamentals + risk management.
-- If you want reliability, focus on ETFs (SPY/QQQ) rather than single small stocks.
+- Put your ticker universe in: `data/tickers.csv`
+- Required columns: `symbol,name,exchange,category`
+- The **Available Tickers** tab displays whatever is in that CSV.
 """
         )
 
