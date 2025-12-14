@@ -1,17 +1,50 @@
-symbol,name,exchange
-AAPL,Apple Inc,NASDAQ
-MSFT,Microsoft Corporation,NASDAQ
-NVDA,NVIDIA Corporation,NASDAQ
-AMZN,Amazon.com Inc,NASDAQ
-GOOGL,Alphabet Inc Class A,NASDAQ
-META,Meta Platforms Inc,NASDAQ
-TSLA,Tesla Inc,NASDAQ
-AMD,Advanced Micro Devices Inc,NASDAQ
-NFLX,Netflix Inc,NASDAQ
-SPY,SPDR S&P 500 ETF Trust,NYSEARCA
-QQQ,Invesco QQQ Trust,NASDAQ
-IWM,iShares Russell 2000 ETF,NYSEARCA
-VOO,Vanguard S&P 500 ETF,NYSEARCA
-VTI,Vanguard Total Stock Market ETF,NYSEARCA
-BTC-USD,Bitcoin USD,Crypto
-ETH-USD,Ethereum USD,Crypto
+symbol,name,exchange,category
+AAPL,Apple Inc,NASDAQ,Stock
+MSFT,Microsoft Corporation,NASDAQ,Stock
+NVDA,NVIDIA Corporation,NASDAQ,Stock
+AMZN,Amazon.com Inc,NASDAQ,Stock
+GOOGL,Alphabet Inc Class A,NASDAQ,Stock
+META,Meta Platforms Inc,NASDAQ,Stock
+TSLA,Tesla Inc,NASDAQ,Stock
+AMD,Advanced Micro Devices Inc,NASDAQ,Stock
+INTC,Intel Corporation,NASDAQ,Stock
+NFLX,Netflix Inc,NASDAQ,Stock
+AVGO,Broadcom Inc,NASDAQ,Stock
+CRM,Salesforce Inc,NYSE,Stock
+ORCL,Oracle Corporation,NYSE,Stock
+IBM,IBM,NYSE,Stock
+ADBE,Adobe Inc,NASDAQ,Stock
+PYPL,PayPal Holdings Inc,NASDAQ,Stock
+UBER,Uber Technologies Inc,NYSE,Stock
+SHOP,Shopify Inc,NYSE,Stock
+SQ,Block Inc,NYSE,Stock
+
+SPY,SPDR S&P 500 ETF Trust,NYSEARCA,ETF
+QQQ,Invesco QQQ Trust,NASDAQ,ETF
+DIA,SPDR Dow Jones Industrial Average ETF,NYSEARCA,ETF
+IWM,iShares Russell 2000 ETF,NYSEARCA,ETF
+VOO,Vanguard S&P 500 ETF,NYSEARCA,ETF
+VTI,Vanguard Total Stock Market ETF,NYSEARCA,ETF
+XLK,Technology Select Sector SPDR Fund,NYSEARCA,ETF
+XLF,Financial Select Sector SPDR Fund,NYSEARCA,ETF
+XLE,Energy Select Sector SPDR Fund,NYSEARCA,ETF
+ARKK,ARK Innovation ETF,NYSEARCA,ETF
+
+GLD,SPDR Gold Shares,NYSEARCA,Commodity
+SLV,iShares Silver Trust,NYSEARCA,Commodity
+USO,United States Oil Fund,NYSEARCA,Commodity
+
+BTC-USD,Bitcoin USD,Crypto,Crypto
+ETH-USD,Ethereum USD,Crypto,Crypto
+SOL-USD,Solana USD,Crypto,Crypto
+BNB-USD,Binance Coin USD,Crypto,Crypto
+XRP-USD,Ripple USD,Crypto,Crypto
+ADA-USD,Cardano USD,Crypto,Crypto
+DOGE-USD,Dogecoin USD,Crypto,Crypto
+
+RELIANCE.NS,Reliance Industries Ltd,NSE India,Stock
+TCS.NS,Tata Consultancy Services,NSE India,Stock
+INFY.NS,Infosys Ltd,NSE India,Stock
+HDFCBANK.NS,HDFC Bank Ltd,NSE India,Stock
+ICICIBANK.NS,ICICI Bank Ltd,NSE India,Stock
+SBIN.NS,State Bank of India,NSE India,Stock

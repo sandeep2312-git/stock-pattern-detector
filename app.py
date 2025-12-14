@@ -6,10 +6,11 @@ import joblib
 import matplotlib.pyplot as plt
 import streamlit as st
 from pathlib import Path
-
 from tensorflow.keras.models import load_model
 
-# ---------------- Paths ----------------
+from feature_engineering import engineer_features, add_market_context
+
+# -------- Paths --------
 DAILY_MODEL_PATH = "models/saved_model.pkl"
 HOURLY_MODEL_PATH = "models/saved_model_hourly.pkl"
 
@@ -17,94 +18,28 @@ DL_MODEL_DIR = "models/dl_model"
 DL_META_PATH = "models/dl_meta.pkl"
 
 TICKERS_CSV = Path("data") / "tickers.csv"
+PORTFOLIO_CSV = Path("data") / "portfolio.csv"
 
 
-# ---------------- Helpers ----------------
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    series = pd.Series(series)
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(window=period, min_periods=period).mean()
-    avg_loss = loss.rolling(window=period, min_periods=period).mean()
-
-    rs = avg_gain / (avg_loss + 1e-9)
-    return 100 - (100 / (1 + rs))
-
-
-def _to_series(x) -> pd.Series:
-    # yfinance sometimes returns DataFrame columns (MultiIndex-ish). Force 1D series.
-    if isinstance(x, pd.DataFrame):
-        x = x.iloc[:, 0]
-    return pd.Series(x)
-
-
+# -------- Data loading --------
 @st.cache_data
 def load_tickers_csv() -> pd.DataFrame:
     if not TICKERS_CSV.exists():
-        return pd.DataFrame(columns=["symbol", "name", "exchange"])
+        return pd.DataFrame(columns=["symbol", "name", "exchange", "category"])
     df = pd.read_csv(TICKERS_CSV)
-
-    for col in ["symbol", "name", "exchange"]:
+    for col in ["symbol", "name", "exchange", "category"]:
         if col not in df.columns:
             df[col] = ""
-
     df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
     df["name"] = df["name"].astype(str).str.strip()
     df["exchange"] = df["exchange"].astype(str).str.strip()
-
-    df = df.dropna(subset=["symbol"])
-    df = df[df["symbol"] != ""]
-    df = df.drop_duplicates(subset=["symbol"])
+    df["category"] = df["category"].astype(str).str.strip()
+    df = df[df["symbol"] != ""].drop_duplicates(subset=["symbol"])
     return df
 
 
-def ticker_picker_ui() -> str:
-    tickers_df = load_tickers_csv()
-
-    st.subheader("Ticker search (CSV)")
-    query = st.text_input(
-        "Search by symbol or company name",
-        value="AAPL",
-        help="This searches data/tickers.csv. Example: type 'apple' or 'AAPL'.",
-    ).strip().lower()
-
-    # If CSV missing / empty -> fallback input
-    if tickers_df.empty:
-        st.warning("tickers.csv not found or empty. Create data/tickers.csv to enable search.")
-        return st.text_input("Enter ticker symbol (fallback)", value="AAPL").strip().upper()
-
-    if query:
-        mask = (
-            tickers_df["symbol"].str.lower().str.contains(query, na=False)
-            | tickers_df["name"].str.lower().str.contains(query, na=False)
-            | tickers_df["exchange"].str.lower().str.contains(query, na=False)
-        )
-        filtered = tickers_df[mask].copy()
-    else:
-        filtered = tickers_df.copy()
-
-    filtered = filtered.head(50)
-
-    if filtered.empty:
-        st.info("No matches found in tickers.csv. Add the symbol to CSV or use fallback entry.")
-        return st.text_input("Enter ticker symbol (fallback)", value="AAPL").strip().upper()
-
-    filtered["label"] = filtered.apply(
-        lambda r: f"{r['symbol']} — {r['name']} ({r['exchange']})"
-        if str(r["exchange"]).strip()
-        else f"{r['symbol']} — {r['name']}",
-        axis=1,
-    )
-
-    choice = st.selectbox("Select a ticker", filtered["label"].tolist(), index=0)
-    symbol = choice.split(" — ", 1)[0].strip().upper()
-    return symbol
-
-
 @st.cache_data(ttl=600)
-def validate_ticker(sym: str, interval: str = "1d") -> bool:
+def validate_ticker(sym: str, interval: str) -> bool:
     try:
         df_test = yf.download(sym, period="10d", interval=interval)
         return df_test is not None and not df_test.empty
@@ -112,87 +47,50 @@ def validate_ticker(sym: str, interval: str = "1d") -> bool:
         return False
 
 
-def engineer_features_for_app(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Must match the feature logic used in:
-      - train_model.py
-      - train_model_dl.py
-    """
-    df = df.copy()
+def ticker_picker_ui(tickers_df: pd.DataFrame) -> str:
+    st.subheader("Ticker search (CSV)")
 
-    close = _to_series(df["Close"])
-    vol = _to_series(df["Volume"]) if "Volume" in df.columns else pd.Series(index=df.index, dtype=float)
+    categories = ["All"] + sorted([c for c in tickers_df["category"].dropna().unique().tolist() if str(c).strip()])
+    category = st.selectbox("Filter category", categories, index=0)
 
-    # Returns
-    df["return_1d"] = close.pct_change()
-    df["return_2d"] = close.pct_change(2)
-    df["return_5d"] = close.pct_change(5)
+    df = tickers_df.copy()
+    if category != "All":
+        df = df[df["category"] == category]
 
-    # Moving averages
-    df["ma_5"] = close.rolling(window=5).mean()
-    df["ma_10"] = close.rolling(window=10).mean()
-    df["ma_20"] = close.rolling(window=20).mean()
+    query = st.text_input("Search symbol / company name", value="AAPL").strip().lower()
 
-    # MA ratios
-    df["ma_5_20_ratio"] = df["ma_5"] / (df["ma_20"] + 1e-9)
-    df["ma_10_20_ratio"] = df["ma_10"] / (df["ma_20"] + 1e-9)
+    if query:
+        mask = (
+            df["symbol"].str.lower().str.contains(query, na=False)
+            | df["name"].str.lower().str.contains(query, na=False)
+            | df["exchange"].str.lower().str.contains(query, na=False)
+        )
+        df = df[mask].copy()
 
-    # Volatility
-    df["vol_5"] = df["return_1d"].rolling(window=5).std()
-    df["vol_10"] = df["return_1d"].rolling(window=10).std()
+    df = df.head(80)
 
-    # RSI
-    df["rsi_14"] = compute_rsi(close, period=14)
+    if df.empty:
+        st.info("No matches. Add symbol to data/tickers.csv or use fallback input.")
+        return st.text_input("Fallback ticker", value="AAPL").strip().upper()
 
-    # Volume (safe)
-    if "Volume" in df.columns:
-        df["volume_change_1"] = vol.pct_change()
-        df["volume_ma_5"] = vol.rolling(window=5).mean()
-        df["volume_ma_20"] = vol.rolling(window=20).mean()
-        df["volume_relative"] = vol / (df["volume_ma_20"] + 1e-9)
-    else:
-        df["volume_change_1"] = np.nan
-        df["volume_ma_5"] = np.nan
-        df["volume_ma_20"] = np.nan
-        df["volume_relative"] = np.nan
-
-    # ATR + Bollinger
-    prev_close = close.shift(1)
-    true_range = pd.concat(
-        [
-            _to_series(df["High"]) - _to_series(df["Low"]),
-            (_to_series(df["High"]) - prev_close).abs(),
-            (_to_series(df["Low"]) - prev_close).abs(),
-        ],
+    df["label"] = df.apply(
+        lambda r: f"{r['symbol']} — {r['name']} ({r['exchange']})" if str(r["exchange"]).strip() else f"{r['symbol']} — {r['name']}",
         axis=1,
-    ).max(axis=1)
-
-    df["atr_14"] = true_range.rolling(window=14).mean()
-
-    rolling_std_20 = close.rolling(window=20).std()
-    df["bb_upper"] = df["ma_20"] + 2 * rolling_std_20
-    df["bb_lower"] = df["ma_20"] - 2 * rolling_std_20
-    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / (df["ma_20"] + 1e-9)
-    df["bb_percent_b"] = (close - df["bb_lower"]) / ((df["bb_upper"] - df["bb_lower"]) + 1e-9)
-
-    df.dropna(inplace=True)
-    return df
+    )
+    choice = st.selectbox("Select ticker", df["label"].tolist(), index=0)
+    return choice.split(" — ", 1)[0].strip().upper()
 
 
 def get_pattern_label(preds, closes) -> str:
     preds = np.array(preds, dtype=float)
     closes = np.array(closes, dtype=float)
-
     if len(preds) < 5 or len(closes) < 10:
         return "Not enough data"
-
     last5 = preds[-5:]
     ones_ratio = last5.mean()
-
     last_prices = closes[-10:]
     x = np.arange(len(last_prices))
     slope = np.polyfit(x, last_prices, 1)[0]
-
     if ones_ratio > 0.6 and slope > 0:
         return "UPTREND / BULLISH"
     if ones_ratio < 0.4 and slope < 0:
@@ -200,32 +98,18 @@ def get_pattern_label(preds, closes) -> str:
     return "SIDEWAYS / NEUTRAL"
 
 
-def load_rf_model(mode: str = "daily"):
-    model_path = DAILY_MODEL_PATH if mode == "daily" else HOURLY_MODEL_PATH
-    if not os.path.exists(model_path):
-        st.error(f"RandomForest model not found: {model_path}. Train it and push it to GitHub.")
-        return None, None, None
-
-    bundle = joblib.load(model_path)
-    clf = bundle.get("clf")
-    reg = bundle.get("reg")
-    feature_cols = bundle.get("features")
-
-    if clf is None or reg is None or feature_cols is None:
-        st.error("Invalid RF model bundle. Retrain using the latest train_model.py")
-        return None, None, None
-    return clf, reg, feature_cols
+def load_rf_model(mode: str):
+    path = DAILY_MODEL_PATH if mode == "daily" else HOURLY_MODEL_PATH
+    if not os.path.exists(path):
+        st.error(f"RF model not found: {path}")
+        return None
+    return joblib.load(path)
 
 
 @st.cache_resource
 def load_dl_model_cached():
-    if (not os.path.exists(DL_MODEL_DIR)) or (not os.path.exists(DL_META_PATH)):
-        st.error(
-            f"Deep learning model not found. Expected: {DL_MODEL_DIR} and {DL_META_PATH}. "
-            "Run train_model_dl.py and push model files to GitHub."
-        )
+    if not (os.path.exists(DL_MODEL_DIR) and os.path.exists(DL_META_PATH)):
         return None, None
-
     model = load_model(DL_MODEL_DIR)
     meta = joblib.load(DL_META_PATH)
     return model, meta
@@ -240,91 +124,138 @@ def build_sequences_for_app(X_scaled: np.ndarray, window: int) -> np.ndarray:
     return np.array(seqs)
 
 
-# ---------------- Streamlit App ----------------
+def run_rf_for_ticker(ticker: str, mode: str, period: str, interval: str, rf_bundle: dict) -> dict:
+    df = yf.download(ticker, period=period, interval=interval)
+    if df is None or df.empty:
+        return {"ticker": ticker, "error": "No data"}
+
+    df_feat = engineer_features(df, include_targets=False)
+    df_feat = add_market_context(df_feat, period=period, interval=interval)
+
+    feature_cols = rf_bundle["features"]
+    feature_cols = [c for c in feature_cols if c in df_feat.columns]  # tolerate missing VIX
+    df_feat = df_feat.dropna(subset=feature_cols).copy()
+    if df_feat.empty:
+        return {"ticker": ticker, "error": "Not enough rows after features"}
+
+    clf = rf_bundle["clf"]
+    reg = rf_bundle["reg"]
+
+    X = df_feat[feature_cols].values
+    preds = clf.predict(X)
+    probs = clf.predict_proba(X)[:, 1]
+    rets = reg.predict(X)
+
+    df_feat["pred_up"] = preds
+    df_feat["prob_up"] = probs
+    df_feat["pred_return"] = rets
+
+    latest = df_feat.iloc[-1]
+    return {
+        "ticker": ticker,
+        "close": float(latest["Close"]),
+        "rsi": float(latest["rsi_14"]),
+        "prob_up": float(latest["prob_up"]),
+        "pred_return": float(latest["pred_return"]),
+        "pattern": get_pattern_label(df_feat["pred_up"].values, df_feat["Close"].values),
+        "df_feat": df_feat,
+    }
+
+
+def load_portfolio() -> pd.DataFrame:
+    if not PORTFOLIO_CSV.exists():
+        return pd.DataFrame(columns=["symbol", "shares", "avg_cost"])
+    df = pd.read_csv(PORTFOLIO_CSV)
+    for c in ["symbol", "shares", "avg_cost"]:
+        if c not in df.columns:
+            df[c] = np.nan
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
+    df["avg_cost"] = pd.to_numeric(df["avg_cost"], errors="coerce")
+    df = df.dropna(subset=["symbol", "shares", "avg_cost"])
+    df = df[df["symbol"] != ""]
+    return df
+
+
+# -------- Streamlit App --------
 def main():
     st.set_page_config(page_title="Stock Pattern Detector", page_icon="📈", layout="wide")
-    st.title("📈 Stock Pattern Detector — ML + Deep Learning")
+    st.title("📈 Stock Pattern Detector — Ticker Search + Compare + Portfolio + Market Context")
 
-    st.sidebar.header("Settings")
+    tickers_df = load_tickers_csv()
+    if tickers_df.empty:
+        st.warning("data/tickers.csv missing or empty. Run: python scripts/update_tickers.py")
 
-    timeframe = st.sidebar.radio("Prediction timeframe", ["Daily (next day)", "Hourly (next hour)"], index=0)
+    st.sidebar.header("Mode")
+    timeframe = st.sidebar.radio("Timeframe", ["Daily (next day)", "Hourly (next hour)"], index=0)
     mode = "daily" if timeframe.startswith("Daily") else "hourly"
-    horizon_text = "next day" if mode == "daily" else "next hour"
+    interval = "1d" if mode == "daily" else "60m"
+    period = st.sidebar.selectbox("History period", ["6mo", "1y", "2y", "5y", "10y"], index=2) if mode == "daily" else "60d"
 
-    algo = st.sidebar.radio("Model type", ["RandomForest (Classic ML)", "LSTM (Deep Learning)"], index=0)
-
-    if algo.startswith("LSTM") and mode == "hourly":
-        st.warning("LSTM is only available for DAILY mode right now. Switching to DAILY.")
+    st.sidebar.header("Model")
+    model_type = st.sidebar.radio("Choose model", ["RandomForest (ML)", "LSTM (DL - daily only)"], index=0)
+    if model_type.startswith("LSTM") and mode == "hourly":
+        st.sidebar.warning("DL is daily-only. Switching to DAILY.")
         mode = "daily"
-        horizon_text = "next day"
+        interval = "1d"
+        period = "2y"
 
-    # -------- Ticker search (Option B) --------
-    ticker = ticker_picker_ui()
+    # ---- Tabs for options ----
+    tab_predict, tab_compare, tab_portfolio, tab_admin = st.tabs(
+        ["🔮 Single Ticker", "🧾 Compare Tickers", "💼 Portfolio Dashboard", "⚙️ Admin/Info"]
+    )
 
-    yf_interval = "1d" if mode == "daily" else "60m"
-    if not validate_ticker(ticker, interval=yf_interval):
-        st.error(f"Ticker '{ticker}' not found / no data available at interval {yf_interval}. Try another.")
-        st.stop()
+    # ---------------- Single ticker ----------------
+    with tab_predict:
+        ticker = ticker_picker_ui(tickers_df) if not tickers_df.empty else st.text_input("Ticker", "AAPL").strip().upper()
 
-    if mode == "daily":
-        period = st.sidebar.selectbox("Historical period (daily)", ["6mo", "1y", "2y", "5y", "10y"], index=2)
-        yf_period = period
-    else:
-        st.sidebar.info("Hourly mode uses 60 days of 60m data (Yahoo limit is tighter).")
-        yf_period = "60d"
+        if not validate_ticker(ticker, interval=interval):
+            st.error(f"Ticker '{ticker}' invalid/no data for interval {interval}.")
+            st.stop()
 
-    st.sidebar.caption("Tip: add more symbols to data/tickers.csv to expand search.")
+        run = st.button("Run analysis", type="primary")
 
-    if st.button("🔍 Run analysis", type="primary"):
-        with st.spinner("Downloading data + running model..."):
-            df = yf.download(ticker, period=yf_period, interval=yf_interval)
-            if df is None or df.empty:
-                st.error("No data returned by Yahoo Finance.")
-                return
+        if run:
+            with st.spinner("Downloading + computing predictions..."):
+                df = yf.download(ticker, period=period, interval=interval)
+                if df is None or df.empty:
+                    st.error("No data returned.")
+                    st.stop()
 
-            df_feat = engineer_features_for_app(df)
-            if df_feat.empty:
-                st.error("Not enough rows after feature engineering (needs rolling windows).")
-                return
+                df_feat = engineer_features(df, include_targets=False)
+                df_feat = add_market_context(df_feat, period=period, interval=interval)
 
-            tab_summary, tab_charts, tab_signals, tab_model = st.tabs(
-                ["📌 Summary", "📊 Charts", "📋 Recent signals", "🧠 Model details"]
-            )
+                if model_type.startswith("RandomForest"):
+                    rf = load_rf_model(mode)
+                    if rf is None:
+                        st.stop()
 
-            # ---------------- RandomForest ----------------
-            if algo.startswith("RandomForest"):
-                clf, reg, feature_cols = load_rf_model(mode=mode)
-                if clf is None:
-                    return
+                    feature_cols = [c for c in rf["features"] if c in df_feat.columns]
+                    df_feat = df_feat.dropna(subset=feature_cols).copy()
+                    if df_feat.empty:
+                        st.error("Not enough data after feature engineering.")
+                        st.stop()
 
-                missing = [c for c in feature_cols if c not in df_feat.columns]
-                if missing:
-                    st.error(f"Feature mismatch. Missing in app: {missing}")
-                    return
+                    X = df_feat[feature_cols].values
+                    preds = rf["clf"].predict(X)
+                    probs = rf["clf"].predict_proba(X)[:, 1]
+                    rets = rf["reg"].predict(X)
 
-                X_all = df_feat[feature_cols]
-                preds = clf.predict(X_all)
-                prob_up = clf.predict_proba(X_all)[:, 1]
-                pred_ret = reg.predict(X_all)
+                    df_feat["pred_up"] = preds
+                    df_feat["prob_up"] = probs
+                    df_feat["pred_return"] = rets
 
-                df_feat["pred_up"] = preds
-                df_feat["prob_up"] = prob_up
-                df_feat["pred_return"] = pred_ret
-
-                latest = df_feat.iloc[-1]
-                pattern = get_pattern_label(df_feat["pred_up"].values, df_feat["Close"].values)
-
-                with tab_summary:
-                    st.subheader(f"{ticker} ({mode.upper()} — RandomForest)")
-                    st.write(f"**Pattern:** {pattern}")
+                    latest = df_feat.iloc[-1]
+                    pattern = get_pattern_label(df_feat["pred_up"].values, df_feat["Close"].values)
 
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Last close", f"${float(latest['Close']):,.2f}")
-                    c2.metric("Prob. UP", f"{float(latest['prob_up']):.1%}")
+                    c1.metric("Last Close", f"${float(latest['Close']):,.2f}")
+                    c2.metric("Prob UP", f"{float(latest['prob_up']):.1%}")
                     c3.metric("RSI(14)", f"{float(latest['rsi_14']):.1f}")
-                    c4.metric(f"Pred. move ({horizon_text})", f"{float(latest['pred_return']) * 100:+.2f}%")
+                    c4.metric("Pred Move", f"{float(latest['pred_return'])*100:+.2f}%")
 
-                with tab_charts:
+                    st.write(f"**Pattern:** {pattern}")
+
                     fig, ax = plt.subplots(figsize=(10, 4))
                     ax.plot(df_feat.index, df_feat["Close"], label="Close")
                     ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
@@ -333,72 +264,56 @@ def main():
                     ax.legend()
                     st.pyplot(fig)
 
-                with tab_signals:
                     st.dataframe(df_feat[["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]].tail(25))
 
-                with tab_model:
-                    st.write("RandomForestClassifier + RandomForestRegressor.")
-                    st.write(f"Horizon: {horizon_text}")
-                    st.write(f"Features ({len(feature_cols)}): {feature_cols}")
+                else:
+                    dl_model, meta = load_dl_model_cached()
+                    if dl_model is None:
+                        st.error("DL model missing. Train train_model_dl.py and push models/dl_model + dl_meta.pkl")
+                        st.stop()
 
-            # ---------------- LSTM Deep Learning (Daily only) ----------------
-            else:
-                model, meta = load_dl_model_cached()
-                if model is None:
-                    return
+                    feature_cols = [c for c in meta["feature_cols"] if c in df_feat.columns]
+                    df_feat = df_feat.dropna(subset=feature_cols).copy()
+                    if df_feat.empty:
+                        st.error("Not enough data after feature engineering.")
+                        st.stop()
 
-                feature_cols = meta["feature_cols"]
-                scaler = meta["scaler"]
-                window = int(meta["window"])
+                    scaler = meta["scaler"]
+                    window = int(meta["window"])
 
-                missing = [c for c in feature_cols if c not in df_feat.columns]
-                if missing:
-                    st.error(f"Feature mismatch for DL model. Missing: {missing}")
-                    return
+                    X_raw = df_feat[feature_cols].values
+                    X_scaled = scaler.transform(X_raw)
+                    X_seq = build_sequences_for_app(X_scaled, window=window)
+                    if X_seq.shape[0] == 0:
+                        st.error(f"Not enough rows for DL window={window}.")
+                        st.stop()
 
-                X_raw = df_feat[feature_cols].values
-                X_scaled = scaler.transform(X_raw)
+                    dir_probs, mag_preds = dl_model.predict(X_seq)
+                    dir_probs = dir_probs.ravel()
+                    mag_preds = mag_preds.ravel()
+                    dir_preds = (dir_probs >= 0.5).astype(int)
 
-                X_seq = build_sequences_for_app(X_scaled, window=window)
-                if X_seq.shape[0] == 0:
-                    st.error(f"Not enough data to build LSTM sequences with window={window}.")
-                    return
+                    df_pred = df_feat.copy()
+                    df_pred["dl_pred_up"] = np.nan
+                    df_pred["dl_prob_up"] = np.nan
+                    df_pred["dl_pred_return"] = np.nan
+                    df_pred.iloc[window:, df_pred.columns.get_loc("dl_pred_up")] = dir_preds
+                    df_pred.iloc[window:, df_pred.columns.get_loc("dl_prob_up")] = dir_probs
+                    df_pred.iloc[window:, df_pred.columns.get_loc("dl_pred_return")] = mag_preds
 
-                dir_probs, mag_preds = model.predict(X_seq)
-                dir_probs = dir_probs.ravel()
-                mag_preds = mag_preds.ravel()
-                dir_preds = (dir_probs >= 0.5).astype(int)
-
-                df_pred = df_feat.copy()
-                df_pred["dl_pred_up"] = np.nan
-                df_pred["dl_prob_up"] = np.nan
-                df_pred["dl_pred_return"] = np.nan
-
-                # align predictions from index [window:] onward
-                df_pred.iloc[window:, df_pred.columns.get_loc("dl_pred_up")] = dir_preds
-                df_pred.iloc[window:, df_pred.columns.get_loc("dl_prob_up")] = dir_probs
-                df_pred.iloc[window:, df_pred.columns.get_loc("dl_pred_return")] = mag_preds
-
-                valid = df_pred["dl_prob_up"].notna() & df_pred["dl_pred_return"].notna()
-                df_valid = df_pred[valid]
-                if df_valid.empty:
-                    st.error("DL predictions produced no valid rows (unexpected).")
-                    return
-
-                latest = df_valid.iloc[-1]
-                pattern = get_pattern_label(df_valid["dl_pred_up"].values, df_valid["Close"].values)
-
-                with tab_summary:
-                    st.subheader(f"{ticker} (DAILY — LSTM)")
-                    st.write(f"**Pattern:** {pattern}")
+                    valid = df_pred["dl_prob_up"].notna() & df_pred["dl_pred_return"].notna()
+                    df_valid = df_pred[valid]
+                    latest = df_valid.iloc[-1]
+                    pattern = get_pattern_label(df_valid["dl_pred_up"].values, df_valid["Close"].values)
 
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Last close", f"${float(latest['Close']):,.2f}")
-                    c2.metric("Prob. UP", f"{float(latest['dl_prob_up']):.1%}")
+                    c1.metric("Last Close", f"${float(latest['Close']):,.2f}")
+                    c2.metric("Prob UP", f"{float(latest['dl_prob_up']):.1%}")
                     c3.metric("RSI(14)", f"{float(latest['rsi_14']):.1f}")
-                    c4.metric("Pred. move (next day)", f"{float(latest['dl_pred_return']) * 100:+.2f}%")
+                    c4.metric("Pred Move", f"{float(latest['dl_pred_return'])*100:+.2f}%")
 
-                with tab_charts:
+                    st.write(f"**Pattern:** {pattern}")
+
                     fig, ax = plt.subplots(figsize=(10, 4))
                     ax.plot(df_feat.index, df_feat["Close"], label="Close")
                     ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
@@ -407,15 +322,115 @@ def main():
                     ax.legend()
                     st.pyplot(fig)
 
-                with tab_signals:
-                    st.dataframe(
-                        df_valid[["Close", "rsi_14", "dl_pred_up", "dl_prob_up", "dl_pred_return"]].tail(25)
-                    )
+                    st.dataframe(df_valid[["Close", "rsi_14", "dl_pred_up", "dl_prob_up", "dl_pred_return"]].tail(25))
 
-                with tab_model:
-                    st.write("LSTM with two heads: direction (classification) + magnitude (regression).")
-                    st.write(f"Window: {window}")
-                    st.write(f"Features ({len(feature_cols)}): {feature_cols}")
+    # ---------------- Compare tickers (RF only for speed) ----------------
+    with tab_compare:
+        st.subheader("Compare multiple tickers (scanner)")
+        if model_type.startswith("LSTM"):
+            st.info("Compare mode uses RandomForest for speed. Switch to RandomForest in sidebar to scan.")
+        else:
+            rf = load_rf_model(mode)
+            if rf is None:
+                st.stop()
+
+            symbols = tickers_df["symbol"].tolist() if not tickers_df.empty else ["AAPL", "MSFT", "NVDA", "SPY", "QQQ"]
+            default = ["AAPL", "MSFT", "NVDA"] if set(["AAPL","MSFT","NVDA"]).issubset(set(symbols)) else symbols[:3]
+            picks = st.multiselect("Pick tickers", symbols, default=default)
+
+            if st.button("Run scan"):
+                rows = []
+                with st.spinner("Scanning tickers..."):
+                    for sym in picks:
+                        if not validate_ticker(sym, interval=interval):
+                            rows.append({"ticker": sym, "error": "Invalid/no data"})
+                            continue
+                        res = run_rf_for_ticker(sym, mode, period, interval, rf)
+                        rows.append(res)
+
+                df_out = pd.DataFrame([{
+                    "Ticker": r.get("ticker"),
+                    "Close": r.get("close"),
+                    "Prob_UP": r.get("prob_up"),
+                    "Pred_Move_%": None if r.get("pred_return") is None else r.get("pred_return") * 100,
+                    "RSI": r.get("rsi"),
+                    "Pattern": r.get("pattern"),
+                    "Error": r.get("error", "")
+                } for r in rows])
+
+                df_out = df_out.sort_values(by="Prob_UP", ascending=False, na_position="last")
+                st.dataframe(df_out, use_container_width=True)
+
+    # ---------------- Portfolio dashboard ----------------
+    with tab_portfolio:
+        st.subheader("Portfolio dashboard (from data/portfolio.csv)")
+        port = load_portfolio()
+        if port.empty:
+            st.warning("Create data/portfolio.csv with columns: symbol, shares, avg_cost")
+        else:
+            rf = load_rf_model("daily")  # portfolio uses daily signals
+            rows = []
+            with st.spinner("Computing portfolio + signals..."):
+                for _, r in port.iterrows():
+                    sym = r["symbol"]
+                    shares = float(r["shares"])
+                    avg_cost = float(r["avg_cost"])
+
+                    dfp = yf.download(sym, period="6mo", interval="1d")
+                    if dfp is None or dfp.empty:
+                        rows.append({"symbol": sym, "error": "No data"})
+                        continue
+
+                    last_close = float(dfp["Close"].iloc[-1])
+                    mv = shares * last_close
+                    cost = shares * avg_cost
+                    pnl = mv - cost
+                    pnl_pct = (pnl / cost) * 100 if cost != 0 else np.nan
+
+                    sig = {"prob_up": np.nan, "pred_return": np.nan, "pattern": ""}
+
+                    if rf is not None:
+                        res = run_rf_for_ticker(sym, "daily", "2y", "1d", rf)
+                        if "error" not in res:
+                            sig["prob_up"] = res["prob_up"]
+                            sig["pred_return"] = res["pred_return"]
+                            sig["pattern"] = res["pattern"]
+
+                    rows.append({
+                        "Symbol": sym,
+                        "Shares": shares,
+                        "Avg Cost": avg_cost,
+                        "Last Close": last_close,
+                        "Market Value": mv,
+                        "Cost Basis": cost,
+                        "P&L": pnl,
+                        "P&L %": pnl_pct,
+                        "Prob UP": sig["prob_up"],
+                        "Pred Move %": sig["pred_return"] * 100 if pd.notna(sig["pred_return"]) else np.nan,
+                        "Pattern": sig["pattern"],
+                    })
+
+            df_port = pd.DataFrame(rows)
+            st.dataframe(df_port, use_container_width=True)
+
+    # ---------------- Admin/Info ----------------
+    with tab_admin:
+        st.subheader("Project files")
+        st.write("- data/tickers.csv: ticker universe")
+        st.write("- data/portfolio.csv: portfolio holdings")
+        st.write("- models/saved_model.pkl: RF daily model")
+        st.write("- models/saved_model_hourly.pkl: RF hourly model (optional)")
+        st.write("- models/dl_model + dl_meta.pkl: LSTM daily model (optional)")
+        st.write("")
+        st.subheader("Quick commands")
+        st.code(
+            "\n".join([
+                "python scripts/update_tickers.py",
+                "python train_model.py --ticker AAPL --period 10y --interval 1d --out models/saved_model.pkl",
+                "python train_model.py --ticker AAPL --period 60d --interval 60m --out models/saved_model_hourly.pkl",
+                "python train_model_dl.py",
+            ])
+        )
 
 
 if __name__ == "__main__":
