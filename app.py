@@ -6,6 +6,7 @@ import joblib
 import matplotlib.pyplot as plt
 import streamlit as st
 from pathlib import Path
+
 from tensorflow.keras.models import load_model
 
 from feature_engineering import engineer_features, add_market_context
@@ -19,6 +20,29 @@ DL_META_PATH = "models/dl_meta.pkl"
 
 TICKERS_CSV = Path("data") / "tickers.csv"
 PORTFOLIO_CSV = Path("data") / "portfolio.csv"
+
+
+# -------- Safe download wrapper (FIX for "No objects to concatenate") --------
+def safe_download(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    """
+    yfinance sometimes raises ValueError('No objects to concatenate') when nothing is returned.
+    This wrapper prevents the whole app from crashing.
+    """
+    t = str(ticker).strip().upper()
+    if not t:
+        return pd.DataFrame()
+
+    try:
+        df = yf.download(t, period=period, interval=interval, group_by="column")
+        if df is None or df.empty:
+            return pd.DataFrame()
+        return df
+    except ValueError as e:
+        if "No objects to concatenate" in str(e):
+            return pd.DataFrame()
+        raise
+    except Exception:
+        return pd.DataFrame()
 
 
 # -------- Data loading --------
@@ -40,11 +64,8 @@ def load_tickers_csv() -> pd.DataFrame:
 
 @st.cache_data(ttl=600)
 def validate_ticker(sym: str, interval: str) -> bool:
-    try:
-        df_test = yf.download(sym, period="10d", interval=interval)
-        return df_test is not None and not df_test.empty
-    except Exception:
-        return False
+    df_test = safe_download(sym, period="10d", interval=interval)
+    return df_test is not None and not df_test.empty
 
 
 def ticker_picker_ui(tickers_df: pd.DataFrame) -> str:
@@ -74,7 +95,9 @@ def ticker_picker_ui(tickers_df: pd.DataFrame) -> str:
         return st.text_input("Fallback ticker", value="AAPL").strip().upper()
 
     df["label"] = df.apply(
-        lambda r: f"{r['symbol']} — {r['name']} ({r['exchange']})" if str(r["exchange"]).strip() else f"{r['symbol']} — {r['name']}",
+        lambda r: f"{r['symbol']} — {r['name']} ({r['exchange']})"
+        if str(r["exchange"]).strip()
+        else f"{r['symbol']} — {r['name']}",
         axis=1,
     )
     choice = st.selectbox("Select ticker", df["label"].tolist(), index=0)
@@ -125,15 +148,16 @@ def build_sequences_for_app(X_scaled: np.ndarray, window: int) -> np.ndarray:
 
 
 def run_rf_for_ticker(ticker: str, mode: str, period: str, interval: str, rf_bundle: dict) -> dict:
-    df = yf.download(ticker, period=period, interval=interval)
+    df = safe_download(ticker, period=period, interval=interval)
     if df is None or df.empty:
-        return {"ticker": ticker, "error": "No data"}
+        return {"ticker": ticker, "error": "No data / invalid symbol"}
 
     df_feat = engineer_features(df, include_targets=False)
     df_feat = add_market_context(df_feat, period=period, interval=interval)
 
     feature_cols = rf_bundle["features"]
     feature_cols = [c for c in feature_cols if c in df_feat.columns]  # tolerate missing VIX
+
     df_feat = df_feat.dropna(subset=feature_cols).copy()
     if df_feat.empty:
         return {"ticker": ticker, "error": "Not enough rows after features"}
@@ -166,12 +190,15 @@ def load_portfolio() -> pd.DataFrame:
     if not PORTFOLIO_CSV.exists():
         return pd.DataFrame(columns=["symbol", "shares", "avg_cost"])
     df = pd.read_csv(PORTFOLIO_CSV)
+
     for c in ["symbol", "shares", "avg_cost"]:
         if c not in df.columns:
             df[c] = np.nan
+
     df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
     df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
     df["avg_cost"] = pd.to_numeric(df["avg_cost"], errors="coerce")
+
     df = df.dropna(subset=["symbol", "shares", "avg_cost"])
     df = df[df["symbol"] != ""]
     return df
@@ -180,7 +207,7 @@ def load_portfolio() -> pd.DataFrame:
 # -------- Streamlit App --------
 def main():
     st.set_page_config(page_title="Stock Pattern Detector", page_icon="📈", layout="wide")
-    st.title("📈 Stock Pattern Detector — Ticker Search + Compare + Portfolio + Market Context")
+    st.title("📈 Stock Pattern Detector — Compare + Portfolio + Safe Downloads")
 
     tickers_df = load_tickers_csv()
     if tickers_df.empty:
@@ -200,7 +227,6 @@ def main():
         interval = "1d"
         period = "2y"
 
-    # ---- Tabs for options ----
     tab_predict, tab_compare, tab_portfolio, tab_admin = st.tabs(
         ["🔮 Single Ticker", "🧾 Compare Tickers", "💼 Portfolio Dashboard", "⚙️ Admin/Info"]
     )
@@ -217,7 +243,7 @@ def main():
 
         if run:
             with st.spinner("Downloading + computing predictions..."):
-                df = yf.download(ticker, period=period, interval=interval)
+                df = safe_download(ticker, period=period, interval=interval)
                 if df is None or df.empty:
                     st.error("No data returned.")
                     st.stop()
@@ -327,24 +353,18 @@ def main():
     # ---------------- Compare tickers (RF only for speed) ----------------
     with tab_compare:
         st.subheader("Compare multiple tickers (scanner)")
-        if model_type.startswith("LSTM"):
-            st.info("Compare mode uses RandomForest for speed. Switch to RandomForest in sidebar to scan.")
+        rf = load_rf_model(mode)
+        if rf is None:
+            st.info("Train and commit the RF model first.")
         else:
-            rf = load_rf_model(mode)
-            if rf is None:
-                st.stop()
-
             symbols = tickers_df["symbol"].tolist() if not tickers_df.empty else ["AAPL", "MSFT", "NVDA", "SPY", "QQQ"]
-            default = ["AAPL", "MSFT", "NVDA"] if set(["AAPL","MSFT","NVDA"]).issubset(set(symbols)) else symbols[:3]
+            default = [s for s in ["AAPL", "MSFT", "NVDA"] if s in symbols] or symbols[:3]
             picks = st.multiselect("Pick tickers", symbols, default=default)
 
             if st.button("Run scan"):
                 rows = []
                 with st.spinner("Scanning tickers..."):
                     for sym in picks:
-                        if not validate_ticker(sym, interval=interval):
-                            rows.append({"ticker": sym, "error": "Invalid/no data"})
-                            continue
                         res = run_rf_for_ticker(sym, mode, period, interval, rf)
                         rows.append(res)
 
@@ -356,29 +376,35 @@ def main():
                     "RSI": r.get("rsi"),
                     "Pattern": r.get("pattern"),
                     "Error": r.get("error", "")
-                } for r in rows])
+                } for r in rows]).sort_values(by="Prob_UP", ascending=False, na_position="last")
 
-                df_out = df_out.sort_values(by="Prob_UP", ascending=False, na_position="last")
                 st.dataframe(df_out, use_container_width=True)
 
-    # ---------------- Portfolio dashboard ----------------
+    # ---------------- Portfolio dashboard (SAFE) ----------------
     with tab_portfolio:
         st.subheader("Portfolio dashboard (from data/portfolio.csv)")
         port = load_portfolio()
+
         if port.empty:
             st.warning("Create data/portfolio.csv with columns: symbol, shares, avg_cost")
         else:
-            rf = load_rf_model("daily")  # portfolio uses daily signals
+            rf_daily = load_rf_model("daily")  # portfolio signals use daily RF
             rows = []
+
             with st.spinner("Computing portfolio + signals..."):
                 for _, r in port.iterrows():
-                    sym = r["symbol"]
+                    sym = str(r["symbol"]).strip().upper()
                     shares = float(r["shares"])
                     avg_cost = float(r["avg_cost"])
 
-                    dfp = yf.download(sym, period="6mo", interval="1d")
+                    dfp = safe_download(sym, period="6mo", interval="1d")
                     if dfp is None or dfp.empty:
-                        rows.append({"symbol": sym, "error": "No data"})
+                        rows.append({
+                            "Symbol": sym,
+                            "Shares": shares,
+                            "Avg Cost": avg_cost,
+                            "Error": "No data / invalid symbol"
+                        })
                         continue
 
                     last_close = float(dfp["Close"].iloc[-1])
@@ -387,14 +413,16 @@ def main():
                     pnl = mv - cost
                     pnl_pct = (pnl / cost) * 100 if cost != 0 else np.nan
 
-                    sig = {"prob_up": np.nan, "pred_return": np.nan, "pattern": ""}
+                    prob_up = np.nan
+                    pred_move_pct = np.nan
+                    pattern = ""
 
-                    if rf is not None:
-                        res = run_rf_for_ticker(sym, "daily", "2y", "1d", rf)
+                    if rf_daily is not None:
+                        res = run_rf_for_ticker(sym, "daily", "2y", "1d", rf_daily)
                         if "error" not in res:
-                            sig["prob_up"] = res["prob_up"]
-                            sig["pred_return"] = res["pred_return"]
-                            sig["pattern"] = res["pattern"]
+                            prob_up = res["prob_up"]
+                            pred_move_pct = res["pred_return"] * 100
+                            pattern = res["pattern"]
 
                     rows.append({
                         "Symbol": sym,
@@ -405,23 +433,16 @@ def main():
                         "Cost Basis": cost,
                         "P&L": pnl,
                         "P&L %": pnl_pct,
-                        "Prob UP": sig["prob_up"],
-                        "Pred Move %": sig["pred_return"] * 100 if pd.notna(sig["pred_return"]) else np.nan,
-                        "Pattern": sig["pattern"],
+                        "Prob UP": prob_up,
+                        "Pred Move %": pred_move_pct,
+                        "Pattern": pattern,
+                        "Error": ""
                     })
 
             df_port = pd.DataFrame(rows)
             st.dataframe(df_port, use_container_width=True)
 
-    # ---------------- Admin/Info ----------------
     with tab_admin:
-        st.subheader("Project files")
-        st.write("- data/tickers.csv: ticker universe")
-        st.write("- data/portfolio.csv: portfolio holdings")
-        st.write("- models/saved_model.pkl: RF daily model")
-        st.write("- models/saved_model_hourly.pkl: RF hourly model (optional)")
-        st.write("- models/dl_model + dl_meta.pkl: LSTM daily model (optional)")
-        st.write("")
         st.subheader("Quick commands")
         st.code(
             "\n".join([
