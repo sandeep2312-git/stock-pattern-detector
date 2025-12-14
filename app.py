@@ -28,11 +28,10 @@ PORTFOLIO_CSV = Path("data") / "portfolio.csv"
 
 # -------- Env detection --------
 def is_streamlit_cloud() -> bool:
-    # Streamlit Cloud repos are mounted at /mount/src/<repo>
     return os.path.exists("/mount/src")
 
 
-# -------- Safe download wrapper (FIX for "No objects to concatenate") --------
+# -------- Safe download wrapper --------
 def safe_download(ticker: str, period: str, interval: str) -> pd.DataFrame:
     """
     yfinance sometimes raises ValueError('No objects to concatenate') when nothing is returned.
@@ -144,10 +143,6 @@ def load_dl_model_cached():
     """
     DL is optional. On Streamlit Cloud (Python 3.13), TF/Keras often can't load.
     This function NEVER crashes the app.
-    Returns:
-      (model, meta) if success
-      (None, {"error": "..."} ) if failure
-      (None, None) if files missing
     """
     if not (os.path.exists(DL_MODEL_DIR) and os.path.exists(DL_META_PATH)):
         return None, None
@@ -172,14 +167,25 @@ def build_sequences_for_app(X_scaled: np.ndarray, window: int) -> np.ndarray:
     return np.array(seqs)
 
 
+# -------- RF cleaning helpers (FIX NaN/Inf crash) --------
+def clean_features(df_feat: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    feat = df_feat[feature_cols].apply(pd.to_numeric, errors="coerce")
+    feat = feat.replace([np.inf, -np.inf], np.nan)
+    mask = feat.notna().all(axis=1)
+    df_clean = df_feat.loc[mask].copy()
+    feat_clean = feat.loc[mask].copy()
+    return df_clean, feat_clean
+
+
 def render_rf_result(df_feat: pd.DataFrame, rf_bundle: dict):
     feature_cols = [c for c in rf_bundle["features"] if c in df_feat.columns]
-    df_feat = df_feat.dropna(subset=feature_cols).copy()
-    if df_feat.empty:
-        st.error("Not enough data after feature engineering.")
+    df_feat, feat = clean_features(df_feat, feature_cols)
+
+    if df_feat.empty or feat.empty:
+        st.error("Not enough valid rows after cleaning NaN/Inf features.")
         st.stop()
 
-    X = df_feat[feature_cols].values
+    X = feat.values
     preds = rf_bundle["clf"].predict(X)
     probs = rf_bundle["clf"].predict_proba(X)[:, 1]
     rets = rf_bundle["reg"].predict(X)
@@ -196,7 +202,6 @@ def render_rf_result(df_feat: pd.DataFrame, rf_bundle: dict):
     c2.metric("Prob UP (RF)", f"{float(latest['prob_up']):.1%}")
     c3.metric("RSI(14)", f"{float(latest['rsi_14']):.1f}")
     c4.metric("Pred Move (RF)", f"{float(latest['pred_return'])*100:+.2f}%")
-
     st.write(f"**Pattern:** {pattern}")
 
     fig, ax = plt.subplots(figsize=(10, 4))
@@ -219,11 +224,11 @@ def run_rf_for_ticker(ticker: str, period: str, interval: str, rf_bundle: dict) 
     df_feat = add_market_context(df_feat, period=period, interval=interval)
 
     feature_cols = [c for c in rf_bundle["features"] if c in df_feat.columns]
-    df_feat = df_feat.dropna(subset=feature_cols).copy()
-    if df_feat.empty:
-        return {"ticker": ticker, "error": "Not enough rows after features"}
+    df_feat, feat = clean_features(df_feat, feature_cols)
+    if df_feat.empty or feat.empty:
+        return {"ticker": ticker, "error": "Not enough valid rows after cleaning NaN/Inf features"}
 
-    X = df_feat[feature_cols].values
+    X = feat.values
     preds = rf_bundle["clf"].predict(X)
     probs = rf_bundle["clf"].predict_proba(X)[:, 1]
     rets = rf_bundle["reg"].predict(X)
@@ -231,8 +236,8 @@ def run_rf_for_ticker(ticker: str, period: str, interval: str, rf_bundle: dict) 
     df_feat["pred_up"] = preds
     df_feat["prob_up"] = probs
     df_feat["pred_return"] = rets
-    latest = df_feat.iloc[-1]
 
+    latest = df_feat.iloc[-1]
     return {
         "ticker": ticker,
         "close": float(latest["Close"]),
@@ -277,11 +282,9 @@ def main():
     period = st.sidebar.selectbox("History period", ["6mo", "1y", "2y", "5y", "10y"], index=2) if mode == "daily" else "60d"
 
     st.sidebar.header("Model")
-    # On Streamlit Cloud, don't offer DL by default (it often fails on Python 3.13)
     model_choices = ["RandomForest (ML)"]
     if not is_streamlit_cloud():
         model_choices.append("LSTM (DL - daily only)")
-
     model_type = st.sidebar.radio("Choose model", model_choices, index=0)
 
     tab_predict, tab_compare, tab_portfolio, tab_admin = st.tabs(
@@ -314,7 +317,6 @@ def main():
                         st.stop()
                     render_rf_result(df_feat, rf)
                 else:
-                    # DL path (local only). If it fails, fallback to RF instead of crashing.
                     dl_model, meta = load_dl_model_cached()
                     if dl_model is None:
                         msg = "DL model unavailable here. Falling back to RandomForest."
