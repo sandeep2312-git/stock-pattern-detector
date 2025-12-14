@@ -7,7 +7,11 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from pathlib import Path
 
-from tensorflow.keras.models import load_model
+# DL imports are optional — keep inside try so Streamlit Cloud doesn't crash
+try:
+    from tensorflow.keras.models import load_model
+except Exception:
+    load_model = None
 
 from feature_engineering import engineer_features, add_market_context
 
@@ -20,6 +24,12 @@ DL_META_PATH = "models/dl_meta.pkl"
 
 TICKERS_CSV = Path("data") / "tickers.csv"
 PORTFOLIO_CSV = Path("data") / "portfolio.csv"
+
+
+# -------- Env detection --------
+def is_streamlit_cloud() -> bool:
+    # Streamlit Cloud repos are mounted at /mount/src/<repo>
+    return os.path.exists("/mount/src")
 
 
 # -------- Safe download wrapper (FIX for "No objects to concatenate") --------
@@ -131,11 +141,26 @@ def load_rf_model(mode: str):
 
 @st.cache_resource
 def load_dl_model_cached():
+    """
+    DL is optional. On Streamlit Cloud (Python 3.13), TF/Keras often can't load.
+    This function NEVER crashes the app.
+    Returns:
+      (model, meta) if success
+      (None, {"error": "..."} ) if failure
+      (None, None) if files missing
+    """
     if not (os.path.exists(DL_MODEL_DIR) and os.path.exists(DL_META_PATH)):
         return None, None
-    model = load_model(DL_MODEL_DIR)
-    meta = joblib.load(DL_META_PATH)
-    return model, meta
+
+    if load_model is None:
+        return None, {"error": "TensorFlow/Keras not available in this environment."}
+
+    try:
+        model = load_model(DL_MODEL_DIR)
+        meta = joblib.load(DL_META_PATH)
+        return model, meta
+    except Exception as e:
+        return None, {"error": str(e)}
 
 
 def build_sequences_for_app(X_scaled: np.ndarray, window: int) -> np.ndarray:
@@ -147,7 +172,45 @@ def build_sequences_for_app(X_scaled: np.ndarray, window: int) -> np.ndarray:
     return np.array(seqs)
 
 
-def run_rf_for_ticker(ticker: str, mode: str, period: str, interval: str, rf_bundle: dict) -> dict:
+def render_rf_result(df_feat: pd.DataFrame, rf_bundle: dict):
+    feature_cols = [c for c in rf_bundle["features"] if c in df_feat.columns]
+    df_feat = df_feat.dropna(subset=feature_cols).copy()
+    if df_feat.empty:
+        st.error("Not enough data after feature engineering.")
+        st.stop()
+
+    X = df_feat[feature_cols].values
+    preds = rf_bundle["clf"].predict(X)
+    probs = rf_bundle["clf"].predict_proba(X)[:, 1]
+    rets = rf_bundle["reg"].predict(X)
+
+    df_feat["pred_up"] = preds
+    df_feat["prob_up"] = probs
+    df_feat["pred_return"] = rets
+
+    latest = df_feat.iloc[-1]
+    pattern = get_pattern_label(df_feat["pred_up"].values, df_feat["Close"].values)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Last Close", f"${float(latest['Close']):,.2f}")
+    c2.metric("Prob UP (RF)", f"{float(latest['prob_up']):.1%}")
+    c3.metric("RSI(14)", f"{float(latest['rsi_14']):.1f}")
+    c4.metric("Pred Move (RF)", f"{float(latest['pred_return'])*100:+.2f}%")
+
+    st.write(f"**Pattern:** {pattern}")
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(df_feat.index, df_feat["Close"], label="Close")
+    ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
+    ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
+    ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
+    ax.legend()
+    st.pyplot(fig)
+
+    st.dataframe(df_feat[["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]].tail(25))
+
+
+def run_rf_for_ticker(ticker: str, period: str, interval: str, rf_bundle: dict) -> dict:
     df = safe_download(ticker, period=period, interval=interval)
     if df is None or df.empty:
         return {"ticker": ticker, "error": "No data / invalid symbol"}
@@ -155,26 +218,21 @@ def run_rf_for_ticker(ticker: str, mode: str, period: str, interval: str, rf_bun
     df_feat = engineer_features(df, include_targets=False)
     df_feat = add_market_context(df_feat, period=period, interval=interval)
 
-    feature_cols = rf_bundle["features"]
-    feature_cols = [c for c in feature_cols if c in df_feat.columns]  # tolerate missing VIX
-
+    feature_cols = [c for c in rf_bundle["features"] if c in df_feat.columns]
     df_feat = df_feat.dropna(subset=feature_cols).copy()
     if df_feat.empty:
         return {"ticker": ticker, "error": "Not enough rows after features"}
 
-    clf = rf_bundle["clf"]
-    reg = rf_bundle["reg"]
-
     X = df_feat[feature_cols].values
-    preds = clf.predict(X)
-    probs = clf.predict_proba(X)[:, 1]
-    rets = reg.predict(X)
+    preds = rf_bundle["clf"].predict(X)
+    probs = rf_bundle["clf"].predict_proba(X)[:, 1]
+    rets = rf_bundle["reg"].predict(X)
 
     df_feat["pred_up"] = preds
     df_feat["prob_up"] = probs
     df_feat["pred_return"] = rets
-
     latest = df_feat.iloc[-1]
+
     return {
         "ticker": ticker,
         "close": float(latest["Close"]),
@@ -182,7 +240,6 @@ def run_rf_for_ticker(ticker: str, mode: str, period: str, interval: str, rf_bun
         "prob_up": float(latest["prob_up"]),
         "pred_return": float(latest["pred_return"]),
         "pattern": get_pattern_label(df_feat["pred_up"].values, df_feat["Close"].values),
-        "df_feat": df_feat,
     }
 
 
@@ -207,7 +264,7 @@ def load_portfolio() -> pd.DataFrame:
 # -------- Streamlit App --------
 def main():
     st.set_page_config(page_title="Stock Pattern Detector", page_icon="📈", layout="wide")
-    st.title("📈 Stock Pattern Detector — Compare + Portfolio + Safe Downloads")
+    st.title("📈 Stock Pattern Detector — RF + Optional DL (Cloud-safe)")
 
     tickers_df = load_tickers_csv()
     if tickers_df.empty:
@@ -220,12 +277,12 @@ def main():
     period = st.sidebar.selectbox("History period", ["6mo", "1y", "2y", "5y", "10y"], index=2) if mode == "daily" else "60d"
 
     st.sidebar.header("Model")
-    model_type = st.sidebar.radio("Choose model", ["RandomForest (ML)", "LSTM (DL - daily only)"], index=0)
-    if model_type.startswith("LSTM") and mode == "hourly":
-        st.sidebar.warning("DL is daily-only. Switching to DAILY.")
-        mode = "daily"
-        interval = "1d"
-        period = "2y"
+    # On Streamlit Cloud, don't offer DL by default (it often fails on Python 3.13)
+    model_choices = ["RandomForest (ML)"]
+    if not is_streamlit_cloud():
+        model_choices.append("LSTM (DL - daily only)")
+
+    model_type = st.sidebar.radio("Choose model", model_choices, index=0)
 
     tab_predict, tab_compare, tab_portfolio, tab_admin = st.tabs(
         ["🔮 Single Ticker", "🧾 Compare Tickers", "💼 Portfolio Dashboard", "⚙️ Admin/Info"]
@@ -255,48 +312,21 @@ def main():
                     rf = load_rf_model(mode)
                     if rf is None:
                         st.stop()
-
-                    feature_cols = [c for c in rf["features"] if c in df_feat.columns]
-                    df_feat = df_feat.dropna(subset=feature_cols).copy()
-                    if df_feat.empty:
-                        st.error("Not enough data after feature engineering.")
-                        st.stop()
-
-                    X = df_feat[feature_cols].values
-                    preds = rf["clf"].predict(X)
-                    probs = rf["clf"].predict_proba(X)[:, 1]
-                    rets = rf["reg"].predict(X)
-
-                    df_feat["pred_up"] = preds
-                    df_feat["prob_up"] = probs
-                    df_feat["pred_return"] = rets
-
-                    latest = df_feat.iloc[-1]
-                    pattern = get_pattern_label(df_feat["pred_up"].values, df_feat["Close"].values)
-
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Last Close", f"${float(latest['Close']):,.2f}")
-                    c2.metric("Prob UP", f"{float(latest['prob_up']):.1%}")
-                    c3.metric("RSI(14)", f"{float(latest['rsi_14']):.1f}")
-                    c4.metric("Pred Move", f"{float(latest['pred_return'])*100:+.2f}%")
-
-                    st.write(f"**Pattern:** {pattern}")
-
-                    fig, ax = plt.subplots(figsize=(10, 4))
-                    ax.plot(df_feat.index, df_feat["Close"], label="Close")
-                    ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
-                    ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
-                    ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
-                    ax.legend()
-                    st.pyplot(fig)
-
-                    st.dataframe(df_feat[["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]].tail(25))
-
+                    render_rf_result(df_feat, rf)
                 else:
+                    # DL path (local only). If it fails, fallback to RF instead of crashing.
                     dl_model, meta = load_dl_model_cached()
                     if dl_model is None:
-                        st.error("DL model missing. Train train_model_dl.py and push models/dl_model + dl_meta.pkl")
-                        st.stop()
+                        msg = "DL model unavailable here. Falling back to RandomForest."
+                        if isinstance(meta, dict) and meta.get("error"):
+                            msg += f"\n\nReason: {meta['error'][:250]}"
+                        st.warning(msg)
+
+                        rf = load_rf_model(mode)
+                        if rf is None:
+                            st.stop()
+                        render_rf_result(df_feat, rf)
+                        return
 
                     feature_cols = [c for c in meta["feature_cols"] if c in df_feat.columns]
                     df_feat = df_feat.dropna(subset=feature_cols).copy()
@@ -334,10 +364,9 @@ def main():
 
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Last Close", f"${float(latest['Close']):,.2f}")
-                    c2.metric("Prob UP", f"{float(latest['dl_prob_up']):.1%}")
+                    c2.metric("Prob UP (DL)", f"{float(latest['dl_prob_up']):.1%}")
                     c3.metric("RSI(14)", f"{float(latest['rsi_14']):.1f}")
-                    c4.metric("Pred Move", f"{float(latest['dl_pred_return'])*100:+.2f}%")
-
+                    c4.metric("Pred Move (DL)", f"{float(latest['dl_pred_return'])*100:+.2f}%")
                     st.write(f"**Pattern:** {pattern}")
 
                     fig, ax = plt.subplots(figsize=(10, 4))
@@ -350,9 +379,9 @@ def main():
 
                     st.dataframe(df_valid[["Close", "rsi_14", "dl_pred_up", "dl_prob_up", "dl_pred_return"]].tail(25))
 
-    # ---------------- Compare tickers (RF only for speed) ----------------
+    # ---------------- Compare tickers (RF only) ----------------
     with tab_compare:
-        st.subheader("Compare multiple tickers (scanner)")
+        st.subheader("Compare multiple tickers (scanner) — RF only")
         rf = load_rf_model(mode)
         if rf is None:
             st.info("Train and commit the RF model first.")
@@ -365,8 +394,7 @@ def main():
                 rows = []
                 with st.spinner("Scanning tickers..."):
                     for sym in picks:
-                        res = run_rf_for_ticker(sym, mode, period, interval, rf)
-                        rows.append(res)
+                        rows.append(run_rf_for_ticker(sym, period, interval, rf))
 
                 df_out = pd.DataFrame([{
                     "Ticker": r.get("ticker"),
@@ -418,7 +446,7 @@ def main():
                     pattern = ""
 
                     if rf_daily is not None:
-                        res = run_rf_for_ticker(sym, "daily", "2y", "1d", rf_daily)
+                        res = run_rf_for_ticker(sym, "2y", "1d", rf_daily)
                         if "error" not in res:
                             prob_up = res["prob_up"]
                             pred_move_pct = res["pred_return"] * 100
@@ -452,6 +480,7 @@ def main():
                 "python train_model_dl.py",
             ])
         )
+        st.write("**Note:** Streamlit Cloud runs Python 3.13. DL loading may fail there; RF is recommended on Cloud.")
 
 
 if __name__ == "__main__":
