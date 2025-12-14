@@ -4,8 +4,21 @@ import yfinance as yf
 
 
 # ---------------- Core helpers ----------------
+def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    yfinance sometimes returns MultiIndex columns like:
+      ('Close','AAPL'), ('Open','AAPL'), ...
+    This converts them to single-level: 'Close', 'Open', ...
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        # Most common: level 0 is OHLCV, level 1 is ticker
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
 def _to_series(x) -> pd.Series:
-    # yfinance sometimes yields DataFrame columns; force 1D
+    # Force 1D series
     if isinstance(x, pd.DataFrame):
         x = x.iloc[:, 0]
     return pd.Series(x)
@@ -30,6 +43,8 @@ def fetch_market_features(symbol: str, period: str, interval: str) -> pd.DataFra
     if df is None or df.empty:
         return pd.DataFrame()
 
+    df = _flatten_yf_columns(df)
+
     close = _to_series(df["Close"])
     out = pd.DataFrame(index=df.index)
 
@@ -46,35 +61,30 @@ def fetch_market_features(symbol: str, period: str, interval: str) -> pd.DataFra
 def add_market_context(df_feat: pd.DataFrame, period: str, interval: str) -> pd.DataFrame:
     """
     Joins SPY + QQQ (+ VIX if available) features onto df_feat index.
+    Also ensures df_feat columns are single-level before join.
     """
     out = df_feat.copy()
+    out = _flatten_yf_columns(out)  # IMPORTANT: fix MultiIndex columns
 
     spy = fetch_market_features("SPY", period=period, interval=interval)
     qqq = fetch_market_features("QQQ", period=period, interval=interval)
-
-    out = out.join(spy, how="left") if not spy.empty else out
-    out = out.join(qqq, how="left") if not qqq.empty else out
-
-    # VIX sometimes doesn't support some intraday intervals reliably; still try.
     vix = fetch_market_features("^VIX", period=period, interval=interval)
-    out = out.join(vix, how="left") if not vix.empty else out
+
+    # Join only if not empty
+    if not spy.empty:
+        out = out.join(spy, how="left")
+    if not qqq.empty:
+        out = out.join(qqq, how="left")
+    if not vix.empty:
+        out = out.join(vix, how="left")
 
     return out
 
 
 # ---------------- Stock feature engineering ----------------
 def engineer_features(df: pd.DataFrame, include_targets: bool = True) -> pd.DataFrame:
-    """
-    Creates the SAME features for:
-      - train_model.py
-      - train_model_dl.py
-      - app.py
-
-    If include_targets=True, adds:
-      - next_return
-      - target_up
-    """
     df = df.copy()
+    df = _flatten_yf_columns(df)  # IMPORTANT: fix MultiIndex from yfinance
 
     close = _to_series(df["Close"])
     vol = _to_series(df["Volume"]) if "Volume" in df.columns else pd.Series(index=df.index, dtype=float)
@@ -100,7 +110,7 @@ def engineer_features(df: pd.DataFrame, include_targets: bool = True) -> pd.Data
     # Momentum
     df["rsi_14"] = compute_rsi(close, period=14)
 
-    # Volume features (safe)
+    # Volume features
     if "Volume" in df.columns:
         df["volume_change_1"] = vol.pct_change()
         df["volume_ma_5"] = vol.rolling(5).mean()
@@ -114,14 +124,18 @@ def engineer_features(df: pd.DataFrame, include_targets: bool = True) -> pd.Data
 
     # ATR
     prev_close = close.shift(1)
+    high = _to_series(df["High"])
+    low = _to_series(df["Low"])
+
     true_range = pd.concat(
         [
-            _to_series(df["High"]) - _to_series(df["Low"]),
-            (_to_series(df["High"]) - prev_close).abs(),
-            (_to_series(df["Low"]) - prev_close).abs(),
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
+
     df["atr_14"] = true_range.rolling(14).mean()
 
     # Bollinger position
@@ -155,7 +169,6 @@ def get_feature_cols(include_market: bool = True) -> list[str]:
     if not include_market:
         return base
 
-    # Market features: SPY, QQQ, VIX (if present; VIX might be missing on some intervals)
     market = [
         "SPY_close", "SPY_ret_1", "SPY_ma_20_ratio", "SPY_vol_10",
         "QQQ_close", "QQQ_ret_1", "QQQ_ma_20_ratio", "QQQ_vol_10",
