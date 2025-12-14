@@ -18,7 +18,6 @@ TICKERS_CSV = Path("data") / "tickers.csv"
 
 # -------------------- helpers --------------------
 def safe_download(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    """Download with strong safety: never crash app on yfinance weirdness."""
     t = str(ticker).strip().upper()
     if not t:
         return pd.DataFrame()
@@ -28,7 +27,6 @@ def safe_download(ticker: str, period: str, interval: str) -> pd.DataFrame:
             return pd.DataFrame()
         return df
     except ValueError as e:
-        # yfinance sometimes throws this if symbol invalid / no rows
         if "No objects to concatenate" in str(e):
             return pd.DataFrame()
         raise
@@ -70,7 +68,6 @@ def bucket_message(bucket: str) -> str:
 
 
 def pred_range_from_history(df_feat: pd.DataFrame, pred_col: str = "pred_return", z: float = 1.5):
-    """Rough move-range band from prediction dispersion."""
     if pred_col not in df_feat.columns:
         return None
     s = pd.to_numeric(df_feat[pred_col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
@@ -108,7 +105,6 @@ def load_rf_model(mode: str):
 
 
 def clean_features(df_feat: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Remove NaN/Inf rows so sklearn won't crash."""
     if not feature_cols:
         return df_feat.iloc[0:0].copy(), df_feat.iloc[0:0].copy()
     feat = df_feat[feature_cols].apply(pd.to_numeric, errors="coerce")
@@ -139,35 +135,6 @@ def validate_ticker(sym: str, interval: str) -> bool:
     return df_test is not None and not df_test.empty
 
 
-def ticker_picker_ui(tickers_df: pd.DataFrame) -> str:
-    st.markdown("### 1) Choose a stock")
-    categories = ["All"] + sorted([c for c in tickers_df["category"].dropna().unique().tolist() if str(c).strip()])
-    category = st.selectbox("Filter (optional)", categories, index=0)
-
-    df = tickers_df.copy()
-    if category != "All":
-        df = df[df["category"] == category]
-
-    query = st.text_input("Search by ticker or company name", value="AAPL").strip().lower()
-    if query:
-        mask = (
-            df["symbol"].str.lower().str.contains(query, na=False)
-            | df["name"].str.lower().str.contains(query, na=False)
-        )
-        df = df[mask].copy()
-
-    df = df.head(60)
-
-    if df.empty:
-        st.info("No match found. Try a different name or enter a ticker directly.")
-        return st.text_input("Enter ticker (example: AAPL)", value="AAPL").strip().upper()
-
-    df["label"] = df.apply(lambda r: f"{r['symbol']} — {r['name']}", axis=1)
-    choice = st.selectbox("Pick one", df["label"].tolist(), index=0)
-    return choice.split(" — ", 1)[0].strip().upper()
-
-
-# -------------------- UI renderers --------------------
 def render_layman_summary(df_feat: pd.DataFrame, rf_bundle: dict, timeframe_label: str):
     feature_cols = [c for c in rf_bundle["features"] if c in df_feat.columns]
     df_feat, feat = clean_features(df_feat, feature_cols)
@@ -194,7 +161,6 @@ def render_layman_summary(df_feat: pd.DataFrame, rf_bundle: dict, timeframe_labe
     bucket = prob_bucket(p_up)
     emoji = bucket_emoji(bucket)
 
-    # Big summary card
     st.markdown("### 3) Result (easy view)")
     st.markdown(
         f"""
@@ -202,26 +168,20 @@ def render_layman_summary(df_feat: pd.DataFrame, rf_bundle: dict, timeframe_labe
   <div style="font-size:28px;font-weight:700;">{emoji} {bucket} Signal</div>
   <div style="font-size:16px;opacity:0.9;margin-top:6px;">{bucket_message(bucket)}</div>
   <div style="margin-top:10px;font-size:14px;opacity:0.85;">
-    Timeframe: <b>{timeframe_label}</b> — This is a short-term statistical guess, not financial advice.
+    Timeframe: <b>{timeframe_label}</b> — short-term statistical guess, not financial advice.
   </div>
 </div>
 """,
         unsafe_allow_html=True,
     )
 
-    # Simple metrics
     st.markdown("#### Key numbers (plain English)")
     c1, c2, c3 = st.columns(3)
     c1.metric("Current price", f"${close:,.2f}")
     c2.metric("Chance of going up", f"{p_up:.0%}")
     c3.metric("Estimated move", f"{pred_ret*100:+.2f}%")
+    st.caption("Chance is confidence (not a guarantee). Estimated move is a rough guess for next period.")
 
-    st.caption(
-        "“Chance of going up” is the model’s confidence (not a guarantee). "
-        "“Estimated move” is a rough guess of the next period % change."
-    )
-
-    # Range
     band = pred_range_from_history(df_feat, pred_col="pred_return", z=1.5)
     if band is not None:
         low = (pred_ret - band) * 100
@@ -230,35 +190,24 @@ def render_layman_summary(df_feat: pd.DataFrame, rf_bundle: dict, timeframe_labe
     else:
         st.caption("Move range: not enough history to estimate uncertainty.")
 
-    # Trend + RSI explanation
-    st.markdown("#### Extra context (still simple)")
+    st.markdown("#### Extra context")
     trend = get_pattern_label(df_feat["pred_up"].values, df_feat["Close"].values)
     c4, c5 = st.columns(2)
     c4.metric("Recent trend", trend)
     c5.metric("RSI (momentum)", f"{rsi:.1f}")
-    st.caption(
-        "RSI is a momentum score. Rough rule: above ~70 can mean “overheated”, below ~30 can mean “oversold”."
-    )
+    st.caption("RSI: above ~70 can mean overheated, below ~30 can mean oversold (only one signal).")
 
-    # Chart
     st.markdown("#### Price chart")
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(df_feat.index, df_feat["Close"], label="Close")
-    if "ma_5" in df_feat.columns:
-        ax.plot(df_feat.index, df_feat["ma_5"], label="Avg (5)")
-    if "ma_10" in df_feat.columns:
-        ax.plot(df_feat.index, df_feat["ma_10"], label="Avg (10)")
-    if "ma_20" in df_feat.columns:
-        ax.plot(df_feat.index, df_feat["ma_20"], label="Avg (20)")
+    for col, label in [("ma_5", "Avg (5)"), ("ma_10", "Avg (10)"), ("ma_20", "Avg (20)")]:
+        if col in df_feat.columns:
+            ax.plot(df_feat.index, df_feat[col], label=label)
     ax.legend()
     st.pyplot(fig)
 
-    # Advanced (collapsed)
     with st.expander("Advanced details (optional)", expanded=False):
-        st.write("Recent rows with model outputs:")
-        st.dataframe(df_feat[["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]].tail(25))
-
-        st.write("Top factors the model generally uses (feature importance):")
+        st.dataframe(df_feat[["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]].tail(25), use_container_width=True)
         try:
             importances = rf_bundle["clf"].feature_importances_
             imp_df = (
@@ -267,19 +216,8 @@ def render_layman_summary(df_feat: pd.DataFrame, rf_bundle: dict, timeframe_labe
                 .head(12)
             )
             st.bar_chart(imp_df.set_index("Feature"))
-            st.caption("These are global importances (overall), not per-day explanations.")
-        except Exception as e:
-            st.caption(f"Could not show importances: {str(e)[:200]}")
-
-    with st.expander("Glossary (plain English)", expanded=False):
-        st.markdown(
-            """
-- **Chance of going up**: how confident the model is the price will rise next period.
-- **Estimated move**: the model’s guess of the next period % change.
-- **RSI**: momentum score (0–100). Above ~70 can mean “overbought”, below ~30 can mean “oversold”.
-- **Moving averages**: smoothed price lines to reduce noise.
-"""
-        )
+        except Exception:
+            st.caption("Could not display feature importances.")
 
 
 def run_rf_for_ticker(ticker: str, period: str, interval: str, rf_bundle: dict) -> dict:
@@ -318,15 +256,14 @@ def run_rf_for_ticker(ticker: str, period: str, interval: str, rf_bundle: dict) 
     }
 
 
-# -------------------- main app --------------------
 def main():
     st.set_page_config(page_title="Stock Trend Helper", page_icon="📈", layout="wide")
 
+    if "chosen_ticker" not in st.session_state:
+        st.session_state["chosen_ticker"] = "AAPL"
+
     st.title("📈 Stock Trend Helper (Easy View)")
-    st.caption(
-        "This app shows a short-term **signal** (Green/Yellow/Red) based on recent price patterns. "
-        "It’s a learning tool — not financial advice."
-    )
+    st.caption("Short-term signal (Green/Yellow/Red) based on recent price patterns. Not financial advice.")
 
     tickers_df = load_tickers_csv()
 
@@ -334,10 +271,7 @@ def main():
     timeframe = st.sidebar.radio("Timeframe", ["Daily (next day)", "Hourly (next hour)"], index=0)
     mode = "daily" if timeframe.startswith("Daily") else "hourly"
     interval = "1d" if mode == "daily" else "60m"
-    period = st.sidebar.selectbox("How much history to use", ["6mo", "1y", "2y", "5y", "10y"], index=2) if mode == "daily" else "60d"
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**Tip:** Green ≠ buy. It only means “more signs point up”. Always manage risk.")
+    period = st.sidebar.selectbox("History length", ["6mo", "1y", "2y", "5y", "10y"], index=2) if mode == "daily" else "60d"
 
     tab_predict, tab_compare, tab_tickers, tab_help = st.tabs(
         ["🔮 Simple Prediction", "🧾 Compare", "📚 Available Tickers", "❓ Help"]
@@ -345,11 +279,15 @@ def main():
 
     # ---------- Prediction ----------
     with tab_predict:
+        st.markdown("### 1) Pick a ticker")
+        default_sym = st.session_state.get("chosen_ticker", "AAPL")
+
         if tickers_df.empty:
-            st.warning("No ticker list found. Add tickers to data/tickers.csv (columns: symbol,name,exchange,category).")
-            ticker = st.text_input("Enter ticker (example: AAPL)", value="AAPL").strip().upper()
+            ticker = st.text_input("Ticker", value=default_sym).strip().upper()
         else:
-            ticker = ticker_picker_ui(tickers_df)
+            # quick picker with fallback
+            ticker = st.text_input("Ticker", value=default_sym).strip().upper()
+            st.caption("Tip: Use the **Available Tickers** tab to browse and pick one-click.")
 
         st.markdown("### 2) Run")
         run = st.button("Run Prediction", type="primary")
@@ -376,7 +314,7 @@ def main():
 
     # ---------- Compare ----------
     with tab_compare:
-        st.markdown("### Compare a few stocks (fast scan)")
+        st.markdown("### Compare a few tickers (fast scan)")
         rf = load_rf_model(mode)
         if rf is None:
             st.info("Train and commit the model first.")
@@ -394,11 +332,11 @@ def main():
                 df_out = pd.DataFrame([{
                     "Ticker": r.get("ticker"),
                     "Price": r.get("price"),
-                    "Chance Up": (None if r.get("chance_up") is None else float(r.get("chance_up"))),
+                    "Chance Up": r.get("chance_up"),
                     "Signal": r.get("signal"),
                     "Est. Move %": r.get("move_pct"),
                     "RSI": r.get("rsi"),
-                    "Plain-English note": r.get("note", ""),
+                    "Note": r.get("note", ""),
                     "Error": r.get("error", "")
                 } for r in rows])
 
@@ -406,37 +344,42 @@ def main():
                 df_out = df_out.sort_values(by=["Error", "Chance Up"], ascending=[True, False], na_position="last")
                 st.dataframe(df_out, use_container_width=True)
 
-    # ---------- Available Tickers ----------
+    # ---------- Available Tickers (expanded + paginated + use button) ----------
     with tab_tickers:
-        st.markdown("## 📚 Available Tickers")
-        st.caption(
-            "This list comes from your `data/tickers.csv`. "
-            "You can search and filter, then copy a symbol into the Prediction tab."
-        )
+        st.markdown("## 📚 Available Tickers (Expanded)")
+        st.caption("This list comes from `data/tickers.csv`. Add thousands of tickers and browse smoothly.")
 
         if tickers_df.empty:
-            st.warning("No ticker list found. Create data/tickers.csv with columns: symbol,name,exchange,category")
+            st.warning("No ticker list found. Create `data/tickers.csv` with columns: symbol,name,exchange,category")
             st.stop()
 
-        c1, c2 = st.columns(2)
+        # Download button
+        st.download_button(
+            "⬇️ Download tickers.csv",
+            data=tickers_df.to_csv(index=False).encode("utf-8"),
+            file_name="tickers.csv",
+            mime="text/csv",
+        )
+
+        c1, c2, c3 = st.columns([1, 1, 2])
         with c1:
             category = st.selectbox(
-                "Filter by category",
+                "Category",
                 ["All"] + sorted([x for x in tickers_df["category"].dropna().unique().tolist() if str(x).strip()]),
             )
         with c2:
             exchange = st.selectbox(
-                "Filter by exchange",
+                "Exchange",
                 ["All"] + sorted([x for x in tickers_df["exchange"].dropna().unique().tolist() if str(x).strip()]),
             )
+        with c3:
+            search = st.text_input("Search (ticker or name)", value="")
 
         df = tickers_df.copy()
         if category != "All":
             df = df[df["category"] == category]
         if exchange != "All":
             df = df[df["exchange"] == exchange]
-
-        search = st.text_input("Search by ticker or company name", value="")
         if search:
             s = search.lower()
             df = df[
@@ -444,41 +387,42 @@ def main():
                 | df["name"].str.lower().str.contains(s, na=False)
             ]
 
-        st.markdown(f"### Showing {len(df)} tickers")
-        st.dataframe(df[["symbol", "name", "exchange", "category"]], use_container_width=True)
+        df = df.sort_values(["category", "symbol"]).reset_index(drop=True)
 
-        st.info("Tip: Copy a ticker symbol from this table and paste it into **Simple Prediction** to analyze it.")
+        st.markdown(f"### Showing **{len(df):,}** tickers")
+
+        # Pagination
+        page_size = st.selectbox("Rows per page", [25, 50, 100, 200], index=1)
+        total_pages = max(1, int(np.ceil(len(df) / page_size)))
+        page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
+
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_df = df.iloc[start:end].copy()
+
+        # Select ticker to use
+        options = (page_df["symbol"] + " — " + page_df["name"]).tolist()
+        if options:
+            pick = st.selectbox("Pick a ticker from this page", options)
+            chosen_symbol = pick.split(" — ", 1)[0].strip().upper()
+
+            if st.button("✅ Use this ticker in Prediction tab"):
+                st.session_state["chosen_ticker"] = chosen_symbol
+                st.success(f"Selected ticker: {chosen_symbol}. Go to **Simple Prediction** tab and click Run.")
+        else:
+            st.info("No tickers match your filters.")
+
+        st.dataframe(page_df[["symbol", "name", "exchange", "category"]], use_container_width=True)
 
     # ---------- Help ----------
     with tab_help:
-        st.markdown("## How to read this app (beginners)")
+        st.markdown("## How to expand tickers")
         st.markdown(
             """
-**Green / Yellow / Red Signal** is a simple summary:
+**Best way:** run `python scripts/update_tickers.py` to generate a bigger `data/tickers.csv`,
+then commit and push.
 
-- 🟢 **Green**: more signs point UP than down.
-- 🟡 **Yellow**: mixed signals (model not confident).
-- 🔴 **Red**: more signs point DOWN/flat than up.
-
-**Important:** this is not a guarantee and not financial advice.
-
-### What is “Chance Up”?
-How confident the model is that the price will be higher next period.
-
-### What is “Estimated move”?
-A rough guess of the next period % change (example: +0.80%).
-
-### Why can it be wrong?
-News, earnings, macro events, and sudden volatility can move prices in ways the model can’t predict.
-"""
-        )
-
-        st.markdown("## Repo setup")
-        st.markdown(
-            """
-- Put your ticker universe in: `data/tickers.csv`
-- Required columns: `symbol,name,exchange,category`
-- The **Available Tickers** tab displays whatever is in that CSV.
+This app reads tickers from `data/tickers.csv`, so expanding tickers is just adding rows there.
 """
         )
 
