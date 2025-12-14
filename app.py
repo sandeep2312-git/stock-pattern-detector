@@ -1,11 +1,12 @@
 import os
-import numpy as np
-import pandas as pd
-import yfinance as yf
+from pathlib import Path
+
 import joblib
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import streamlit as st
-from pathlib import Path
+import yfinance as yf
 
 # DL imports are optional — keep inside try so Streamlit Cloud doesn't crash
 try:
@@ -29,6 +30,39 @@ PORTFOLIO_CSV = Path("data") / "portfolio.csv"
 # -------- Env detection --------
 def is_streamlit_cloud() -> bool:
     return os.path.exists("/mount/src")
+
+
+# -------- UI helpers --------
+def prob_badge(p: float) -> str:
+    if p >= 0.60:
+        return "🟢 High"
+    if p >= 0.40:
+        return "🟡 Medium"
+    return "🔴 Low"
+
+
+def safe_float(x, default=np.nan) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def pred_range_from_history(df_feat: pd.DataFrame, pred_col: str = "pred_return", z: float = 1.5):
+    """
+    Simple uncertainty band using recent prediction dispersion (not a true CI).
+    """
+    if pred_col not in df_feat.columns:
+        return None
+    s = pd.to_numeric(df_feat[pred_col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if len(s) < 30:
+        return None
+    std = float(s.tail(120).std())  # last ~120 points
+    if not np.isfinite(std) or std <= 0:
+        return None
+    return std * z
 
 
 # -------- Safe download wrapper --------
@@ -167,7 +201,7 @@ def build_sequences_for_app(X_scaled: np.ndarray, window: int) -> np.ndarray:
     return np.array(seqs)
 
 
-# -------- RF cleaning helpers (FIX NaN/Inf crash) --------
+# -------- RF cleaning helpers (Fix NaN/Inf crash) --------
 def clean_features(df_feat: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     feat = df_feat[feature_cols].apply(pd.to_numeric, errors="coerce")
     feat = feat.replace([np.inf, -np.inf], np.nan)
@@ -186,6 +220,7 @@ def render_rf_result(df_feat: pd.DataFrame, rf_bundle: dict):
         st.stop()
 
     X = feat.values
+
     preds = rf_bundle["clf"].predict(X)
     probs = rf_bundle["clf"].predict_proba(X)[:, 1]
     rets = rf_bundle["reg"].predict(X)
@@ -195,24 +230,61 @@ def render_rf_result(df_feat: pd.DataFrame, rf_bundle: dict):
     df_feat["pred_return"] = rets
 
     latest = df_feat.iloc[-1]
+    p_up = safe_float(latest["prob_up"])
+    pred_ret = safe_float(latest["pred_return"])
+    close = safe_float(latest["Close"])
+    rsi = safe_float(latest["rsi_14"])
+
     pattern = get_pattern_label(df_feat["pred_up"].values, df_feat["Close"].values)
 
+    # ---- Metrics with tooltips ----
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Last Close", f"${float(latest['Close']):,.2f}")
-    c2.metric("Prob UP (RF)", f"{float(latest['prob_up']):.1%}")
-    c3.metric("RSI(14)", f"{float(latest['rsi_14']):.1f}")
-    c4.metric("Pred Move (RF)", f"{float(latest['pred_return'])*100:+.2f}%")
+    c1.metric("Last Close", f"${close:,.2f}", help="Most recent close price from Yahoo Finance")
+    c2.metric(
+        f"Prob UP (RF) {prob_badge(p_up)}",
+        f"{p_up:.1%}",
+        help="Model probability that the next period return is positive",
+    )
+    c3.metric("RSI(14)", f"{rsi:.1f}", help="Relative Strength Index: >70 overbought, <30 oversold")
+    c4.metric("Pred Move (RF)", f"{pred_ret*100:+.2f}%", help="Predicted next-period return (regression)")
+
     st.write(f"**Pattern:** {pattern}")
 
+    # ---- Confidence band ----
+    band = pred_range_from_history(df_feat, pred_col="pred_return", z=1.5)
+    if band is not None:
+        low = (pred_ret - band) * 100
+        high = (pred_ret + band) * 100
+        st.info(f"📌 Expected move range (approx): **{low:+.2f}% → {high:+.2f}%**")
+    else:
+        st.caption("Move range: not enough history to estimate uncertainty band.")
+
+    # ---- Price chart ----
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(df_feat.index, df_feat["Close"], label="Close")
-    ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
-    ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
-    ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
+    if "ma_5" in df_feat.columns:
+        ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
+    if "ma_10" in df_feat.columns:
+        ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
+    if "ma_20" in df_feat.columns:
+        ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
     ax.legend()
     st.pyplot(fig)
 
     st.dataframe(df_feat[["Close", "rsi_14", "pred_up", "prob_up", "pred_return"]].tail(25))
+
+    # ---- Explainability ----
+    st.subheader("🔎 Why the model predicts this (Top Drivers)")
+    try:
+        importances = rf_bundle["clf"].feature_importances_
+        imp_df = pd.DataFrame(
+            {"Feature": rf_bundle["features"], "Importance": importances}
+        ).sort_values("Importance", ascending=False).head(12)
+
+        st.bar_chart(imp_df.set_index("Feature"))
+        st.caption("Global feature importances from the RandomForest model (not per-row SHAP).")
+    except Exception as e:
+        st.caption(f"Could not display feature importances: {str(e)[:200]}")
 
 
 def run_rf_for_ticker(ticker: str, period: str, interval: str, rf_bundle: dict) -> dict:
@@ -240,10 +312,10 @@ def run_rf_for_ticker(ticker: str, period: str, interval: str, rf_bundle: dict) 
     latest = df_feat.iloc[-1]
     return {
         "ticker": ticker,
-        "close": float(latest["Close"]),
-        "rsi": float(latest["rsi_14"]),
-        "prob_up": float(latest["prob_up"]),
-        "pred_return": float(latest["pred_return"]),
+        "close": safe_float(latest.get("Close")),
+        "rsi": safe_float(latest.get("rsi_14")),
+        "prob_up": safe_float(latest.get("prob_up")),
+        "pred_return": safe_float(latest.get("pred_return")),
         "pattern": get_pattern_label(df_feat["pred_up"].values, df_feat["Close"].values),
     }
 
@@ -328,58 +400,70 @@ def main():
                         if rf is None:
                             st.stop()
                         render_rf_result(df_feat, rf)
-                        return
+                    else:
+                        # DL inference (local only; still supported)
+                        feature_cols = [c for c in meta["feature_cols"] if c in df_feat.columns]
+                        df_feat = df_feat.dropna(subset=feature_cols).copy()
+                        if df_feat.empty:
+                            st.error("Not enough data after feature engineering.")
+                            st.stop()
 
-                    feature_cols = [c for c in meta["feature_cols"] if c in df_feat.columns]
-                    df_feat = df_feat.dropna(subset=feature_cols).copy()
-                    if df_feat.empty:
-                        st.error("Not enough data after feature engineering.")
-                        st.stop()
+                        scaler = meta["scaler"]
+                        window = int(meta["window"])
 
-                    scaler = meta["scaler"]
-                    window = int(meta["window"])
+                        X_raw = df_feat[feature_cols].values
+                        X_scaled = scaler.transform(X_raw)
+                        X_seq = build_sequences_for_app(X_scaled, window=window)
+                        if X_seq.shape[0] == 0:
+                            st.error(f"Not enough rows for DL window={window}.")
+                            st.stop()
 
-                    X_raw = df_feat[feature_cols].values
-                    X_scaled = scaler.transform(X_raw)
-                    X_seq = build_sequences_for_app(X_scaled, window=window)
-                    if X_seq.shape[0] == 0:
-                        st.error(f"Not enough rows for DL window={window}.")
-                        st.stop()
+                        dir_probs, mag_preds = dl_model.predict(X_seq)
+                        dir_probs = dir_probs.ravel()
+                        mag_preds = mag_preds.ravel()
+                        dir_preds = (dir_probs >= 0.5).astype(int)
 
-                    dir_probs, mag_preds = dl_model.predict(X_seq)
-                    dir_probs = dir_probs.ravel()
-                    mag_preds = mag_preds.ravel()
-                    dir_preds = (dir_probs >= 0.5).astype(int)
+                        df_pred = df_feat.copy()
+                        df_pred["dl_pred_up"] = np.nan
+                        df_pred["dl_prob_up"] = np.nan
+                        df_pred["dl_pred_return"] = np.nan
+                        df_pred.iloc[window:, df_pred.columns.get_loc("dl_pred_up")] = dir_preds
+                        df_pred.iloc[window:, df_pred.columns.get_loc("dl_prob_up")] = dir_probs
+                        df_pred.iloc[window:, df_pred.columns.get_loc("dl_pred_return")] = mag_preds
 
-                    df_pred = df_feat.copy()
-                    df_pred["dl_pred_up"] = np.nan
-                    df_pred["dl_prob_up"] = np.nan
-                    df_pred["dl_pred_return"] = np.nan
-                    df_pred.iloc[window:, df_pred.columns.get_loc("dl_pred_up")] = dir_preds
-                    df_pred.iloc[window:, df_pred.columns.get_loc("dl_prob_up")] = dir_probs
-                    df_pred.iloc[window:, df_pred.columns.get_loc("dl_pred_return")] = mag_preds
+                        valid = df_pred["dl_prob_up"].notna() & df_pred["dl_pred_return"].notna()
+                        df_valid = df_pred[valid]
+                        latest = df_valid.iloc[-1]
+                        pattern = get_pattern_label(df_valid["dl_pred_up"].values, df_valid["Close"].values)
 
-                    valid = df_pred["dl_prob_up"].notna() & df_pred["dl_pred_return"].notna()
-                    df_valid = df_pred[valid]
-                    latest = df_valid.iloc[-1]
-                    pattern = get_pattern_label(df_valid["dl_pred_up"].values, df_valid["Close"].values)
+                        p_up = safe_float(latest["dl_prob_up"])
+                        pred_ret = safe_float(latest["dl_pred_return"])
+                        close = safe_float(latest["Close"])
+                        rsi = safe_float(latest["rsi_14"])
 
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Last Close", f"${float(latest['Close']):,.2f}")
-                    c2.metric("Prob UP (DL)", f"{float(latest['dl_prob_up']):.1%}")
-                    c3.metric("RSI(14)", f"{float(latest['rsi_14']):.1f}")
-                    c4.metric("Pred Move (DL)", f"{float(latest['dl_pred_return'])*100:+.2f}%")
-                    st.write(f"**Pattern:** {pattern}")
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Last Close", f"${close:,.2f}", help="Most recent close price from Yahoo Finance")
+                        c2.metric(
+                            f"Prob UP (DL) {prob_badge(p_up)}",
+                            f"{p_up:.1%}",
+                            help="DL model probability that next period return is positive",
+                        )
+                        c3.metric("RSI(14)", f"{rsi:.1f}", help="Relative Strength Index: >70 overbought, <30 oversold")
+                        c4.metric("Pred Move (DL)", f"{pred_ret*100:+.2f}%", help="Predicted next-period return (DL magnitude head)")
+                        st.write(f"**Pattern:** {pattern}")
 
-                    fig, ax = plt.subplots(figsize=(10, 4))
-                    ax.plot(df_feat.index, df_feat["Close"], label="Close")
-                    ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
-                    ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
-                    ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
-                    ax.legend()
-                    st.pyplot(fig)
+                        fig, ax = plt.subplots(figsize=(10, 4))
+                        ax.plot(df_feat.index, df_feat["Close"], label="Close")
+                        if "ma_5" in df_feat.columns:
+                            ax.plot(df_feat.index, df_feat["ma_5"], label="MA 5")
+                        if "ma_10" in df_feat.columns:
+                            ax.plot(df_feat.index, df_feat["ma_10"], label="MA 10")
+                        if "ma_20" in df_feat.columns:
+                            ax.plot(df_feat.index, df_feat["ma_20"], label="MA 20")
+                        ax.legend()
+                        st.pyplot(fig)
 
-                    st.dataframe(df_valid[["Close", "rsi_14", "dl_pred_up", "dl_prob_up", "dl_pred_return"]].tail(25))
+                        st.dataframe(df_valid[["Close", "rsi_14", "dl_pred_up", "dl_prob_up", "dl_pred_return"]].tail(25))
 
     # ---------------- Compare tickers (RF only) ----------------
     with tab_compare:
@@ -402,12 +486,15 @@ def main():
                     "Ticker": r.get("ticker"),
                     "Close": r.get("close"),
                     "Prob_UP": r.get("prob_up"),
-                    "Pred_Move_%": None if r.get("pred_return") is None else r.get("pred_return") * 100,
+                    "Confidence": (prob_badge(r.get("prob_up")) if r.get("prob_up") is not None and np.isfinite(r.get("prob_up")) else ""),
+                    "Pred_Move_%": None if r.get("pred_return") is None or not np.isfinite(r.get("pred_return")) else r.get("pred_return") * 100,
                     "RSI": r.get("rsi"),
                     "Pattern": r.get("pattern"),
                     "Error": r.get("error", "")
-                } for r in rows]).sort_values(by="Prob_UP", ascending=False, na_position="last")
+                } for r in rows])
 
+                # Sort best first; errors bottom
+                df_out = df_out.sort_values(by=["Error", "Prob_UP"], ascending=[True, False], na_position="last")
                 st.dataframe(df_out, use_container_width=True)
 
     # ---------------- Portfolio dashboard (SAFE) ----------------
@@ -464,6 +551,7 @@ def main():
                         "P&L": pnl,
                         "P&L %": pnl_pct,
                         "Prob UP": prob_up,
+                        "Confidence": (prob_badge(prob_up) if np.isfinite(prob_up) else ""),
                         "Pred Move %": pred_move_pct,
                         "Pattern": pattern,
                         "Error": ""
@@ -472,6 +560,7 @@ def main():
             df_port = pd.DataFrame(rows)
             st.dataframe(df_port, use_container_width=True)
 
+    # ---------------- Admin / Info ----------------
     with tab_admin:
         st.subheader("Quick commands")
         st.code(
